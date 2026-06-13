@@ -319,29 +319,26 @@ class RunPod:
         lista tiene stock en ninguna nube."""
         key = RunPod._api_key_activa or RUNPOD_API_KEY
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        bootstrap = build_bootstrap()
         # env como OBJETO (en REST, no lista).
         env_obj = {k: str(v) for k, v in env_vars.items()}
         # Probamos primero SECURE, y si no hay en ninguna GPU, COMMUNITY.
         ultimos_errores = []
         for cloud in ("SECURE", "COMMUNITY"):
+            # Body con SOLO los campos que el esquema REST de RunPod acepta.
+            # (Quitamos computeType, dataCenterPriority, minRAMPerGPU/minVCPUPerGPU
+            #  y volumeMountPath, que provocaban el error 400 de esquema.)
             body = {
                 "name": f"render-gs-{job_id[:8]}",
                 "imageName": RUNPOD_IMAGE,
                 "cloudType": cloud,
-                "computeType": "GPU",
-                "gpuTypeIds": GPU_FALLBACK_LIST,        # lista → fallback auto
-                "gpuTypePriority": "availability",      # la 1ª disponible
+                "gpuTypeIds": GPU_FALLBACK_LIST,        # lista en orden → fallback
+                "gpuTypePriority": "availability",      # la 1ª disponible (respeta orden)
                 "gpuCount": 1,
                 "containerDiskInGb": POD_CONTAINER_DISK_GB,
                 "volumeInGb": POD_VOLUME_DISK_GB,
                 "volumeMountPath": "/workspace",
-                "minRAMPerGPU": 20,                     # por GPU (REST), no total
-                "minVCPUPerGPU": 4,                     # por GPU (REST), no total
-                "dataCenterPriority": "availability",   # cualquier datacenter
                 "ports": ["8888/http"],
                 "env": env_obj,
-                # dockerArgs (GraphQL) → en REST el arranque va en dockerStartCmd.
                 "dockerStartCmd": ["bash", "-lc", _bootstrap_body()],
             }
             try:
@@ -349,18 +346,18 @@ class RunPod:
                     r = await c.post(f"{RUNPOD_REST_URL}/pods", headers=headers, json=body)
                 if r.status_code in (200, 201):
                     data = r.json()
-                    gpu_usada = "?"
-                    # La respuesta REST trae la GPU asignada en machine/gpu.
+                    gpu_usada = "GPU asignada"
                     try:
-                        gpu_usada = (data.get("machine", {}) or {}).get("gpuTypeId") \
-                                    or (data.get("gpu", {}) or {}).get("id") \
-                                    or "GPU asignada"
+                        m = data.get("machine") or {}
+                        gpu_usada = m.get("gpuTypeId") or m.get("gpuDisplayName") \
+                                    or (data.get("gpu") or {}).get("id") or "GPU asignada"
                     except Exception:
                         pass
                     print(f"[rest] pod creado en {cloud}: {data.get('id')} ({gpu_usada})")
                     return data, gpu_usada
                 else:
-                    msg = f"{cloud} HTTP {r.status_code}: {r.text[:300]}"
+                    # Guardar el error COMPLETO (no cortado) para diagnosticar.
+                    msg = f"{cloud} HTTP {r.status_code}: {r.text}"
                     print(f"[rest] {msg}")
                     ultimos_errores.append(msg)
             except Exception as e:
@@ -368,8 +365,8 @@ class RunPod:
                 print(f"[rest] {msg}")
                 ultimos_errores.append(msg)
         raise RuntimeError(
-            "Ninguna GPU de la lista tiene stock (probado SECURE y COMMUNITY). "
-            f"Detalle: {' | '.join(ultimos_errores[:4])}"
+            "RunPod rechazó la creación del pod. "
+            f"Detalle: {' || '.join(ultimos_errores[:2])}"
         )
 
     @staticmethod
