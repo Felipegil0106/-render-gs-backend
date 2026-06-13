@@ -57,8 +57,13 @@ def _runpod_key_de_cuenta(cuenta_id):
 # ── CAMBIO 1: imagen NUEVA (2DGS + COLMAP) en vez de la vieja ──
 RUNPOD_IMAGE        = os.environ.get("RUNPOD_IMAGE", "felipegil0106/render-gs:v2")
 
-# Config del pod (igual que el viejo)
-POD_CONTAINER_DISK_GB = 60
+# Config del pod — AJUSTADO para caber en 4090 con 40GB de disco total.
+# Antes pedíamos 60+100=160GB y RunPod rechazaba las 4090 (solo tienen 40GB).
+# Para una habitación con 2DGS, 30GB de container sobra; volumen 0 (todo el
+# trabajo va en el container, no necesitamos disco persistente).
+# Config del pod — IGUAL que el backend viejo que SÍ conseguía la 4090.
+# (El viejo usaba 50 container + 100 volumen y funcionaba; lo replicamos.)
+POD_CONTAINER_DISK_GB = 50
 POD_VOLUME_DISK_GB    = 100
 POD_MIN_VCPU          = 8
 POD_MIN_MEMORY_GB     = 32
@@ -83,6 +88,7 @@ GPU_PREFERENCES = [
     ("RTX A4500",       ["a4500"],               ["pro", "ada"]),
     ("RTX A4000",       ["a4000"],               ["pro", "ada"]),
 ]
+# Disco por GPU (igual que el backend viejo que funcionaba).
 GPU_DISK_CONFIG = {
     "A100 SXM 80GB":   {"container": 60, "volume": 120},
     "A100 PCIe 80GB":  {"container": 60, "volume": 120},
@@ -460,6 +466,28 @@ def health():
 @app.get("/api/runpod/cuentas")
 def runpod_cuentas():
     return {"cuentas": _runpod_cuentas_disponibles()}
+
+@app.get("/api/debug/gpus")
+async def debug_gpus(cuenta: str = "1"):
+    """Diagnóstico: muestra qué GPUs ve RunPod y cuáles coinciden con el ranking.
+    Úsalo con ?cuenta=1 o ?cuenta=2 para probar cada cuenta."""
+    RunPod.set_cuenta(cuenta)
+    all_gpus = await RunPod.list_all_gpus()
+    matched = []
+    for label, req, forb in GPU_PREFERENCES:
+        found = []
+        for g in all_gpus:
+            name = g.get("displayName","")
+            if RunPod._matches(name, req, forb):
+                found.append({"name":name, "id":g.get("id"), "vram":g.get("memoryInGb")})
+        matched.append({"label":label, "matches":found})
+    return {
+        "cuenta_probada": cuenta,
+        "total_gpus_que_ve_runpod": len(all_gpus),
+        "todas": [{"name":g.get("displayName",""), "vram":g.get("memoryInGb",0),
+                 "id":g.get("id")} for g in all_gpus],
+        "coincidencias_ranking": matched,
+    }
 
 @app.post("/api/jobs")
 async def create_job(file: UploadFile = File(...), quality: str = Form("fast"),
