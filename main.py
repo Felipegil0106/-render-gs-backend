@@ -54,12 +54,11 @@ GPU_FALLBACK_LIST = [
     "NVIDIA L40",                         # 5º
     "NVIDIA A100 80GB PCIe",              # 6º
     "NVIDIA A100-SXM4-80GB",              # 7º
-    "NVIDIA A100-SXM4-40GB",              # 8º
-    "NVIDIA A40",                         # 9º
-    "NVIDIA GeForce RTX 3090 Ti",         # 10º
-    "NVIDIA GeForce RTX 3090",            # 11º
-    "NVIDIA RTX A5000",                   # 12º
-    "NVIDIA L4",                          # 13º
+    "NVIDIA A40",                         # 8º
+    "NVIDIA GeForce RTX 3090 Ti",         # 9º
+    "NVIDIA GeForce RTX 3090",            # 10º
+    "NVIDIA RTX A5000",                   # 11º
+    "NVIDIA L4",                          # 12º
 ]
 RUNPOD_CUENTA_1_NOMBRE = os.environ.get("RUNPOD_CUENTA_1_NOMBRE", "Cuenta 1")
 RUNPOD_CUENTA_2_NOMBRE = os.environ.get("RUNPOD_CUENTA_2_NOMBRE", "Cuenta 2")
