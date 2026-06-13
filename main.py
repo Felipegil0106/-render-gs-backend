@@ -3,7 +3,7 @@ Backend Render-GS (2DGS) — Orquestación de Pods GPU para PRUEBAS
 ═══════════════════════════════════════════════════════════════════
 Backend SEPARADO del viejo. Misma lógica probada (cascada de GPUs,
 watchdog, HMAC, terminación de pod), pero apunta al motor NUEVO 2DGS:
-  - Imagen:  felipegil0106/render-gs:v2  (2DGS + COLMAP)
+  - Imagen:  felipegil0106/render-gs:v1  (2DGS + COLMAP)
   - Worker:  render-gs-worker/worker_gs.py
   - Entrega: malla CRUDA (.ply) para medir la geometría (paredes/cuadrado)
 
@@ -77,7 +77,7 @@ def _runpod_key_de_cuenta(cuenta_id):
     return RUNPOD_API_KEY
 
 # ── CAMBIO 1: imagen NUEVA (2DGS + COLMAP) en vez de la vieja ──
-RUNPOD_IMAGE        = os.environ.get("RUNPOD_IMAGE", "felipegil0106/render-gs:v2")
+RUNPOD_IMAGE        = os.environ.get("RUNPOD_IMAGE", "felipegil0106/render-gs:v1")
 
 # Config del pod — AJUSTADO para caber en 4090 con 40GB de disco total.
 # Antes pedíamos 60+100=160GB y RunPod rechazaba las 4090 (solo tienen 40GB).
@@ -241,7 +241,7 @@ def _bootstrap_body() -> str:
     bootstrap de GraphQL (envuelto) como la REST API (en dockerStartCmd)."""
     return (
         "set -e; "
-        "echo \"[bootstrap] iniciando (imagen render-gs:v2 con 2DGS+COLMAP)\"; "
+        "echo \"[bootstrap] iniciando (imagen render-gs:v1 con 2DGS+COLMAP)\"; "
         "which colmap && echo \"[bootstrap] colmap OK\" || echo \"[bootstrap] WARN: falta colmap\"; "
         "python -c \"import diff_surfel_rasterization; print(\\\"[bootstrap] 2DGS OK\\\")\" || echo \"[bootstrap] WARN: falta 2DGS\"; "
         "pip install --no-cache-dir boto3==1.34.34 >/dev/null 2>&1 || pip install boto3; "
