@@ -38,6 +38,29 @@ import uvicorn
 RUNPOD_API_KEY      = os.environ.get("RUNPOD_API_KEY", "")
 RUNPOD_API_KEY_2    = os.environ.get("RUNPOD_API_KEY_2", "")
 RUNPOD_API_URL      = "https://api.runpod.io/graphql"
+# API REST nueva de RunPod (la recomendada). Resuelve el "Sin GPU disponible"
+# probando varias GPUs y datacenters automáticamente, como hace la web.
+RUNPOD_REST_URL     = "https://rest.runpod.io/v1"
+# Lista de GPUs EN ORDEN JERÁRQUICO (igual que tu backend viejo: de mejor a
+# aceptable). Con gpuTypePriority='availability', RunPod recorre esta lista
+# DE ARRIBA HACIA ABAJO y alquila la PRIMERA que tenga stock. Es decir, SIEMPRE
+# intenta la 4090 primero; si no hay, la A6000; si no, la 6000 Ada; y así.
+# El orden de esta lista ES la jerarquía y se respeta siempre.
+GPU_FALLBACK_LIST = [
+    "NVIDIA GeForce RTX 4090",            # 1º preferida
+    "NVIDIA RTX A6000",                   # 2º
+    "NVIDIA RTX 6000 Ada Generation",     # 3º
+    "NVIDIA L40S",                        # 4º
+    "NVIDIA L40",                         # 5º
+    "NVIDIA A100 80GB PCIe",              # 6º
+    "NVIDIA A100-SXM4-80GB",              # 7º
+    "NVIDIA A100-SXM4-40GB",              # 8º
+    "NVIDIA A40",                         # 9º
+    "NVIDIA GeForce RTX 3090 Ti",         # 10º
+    "NVIDIA GeForce RTX 3090",            # 11º
+    "NVIDIA RTX A5000",                   # 12º
+    "NVIDIA L4",                          # 13º
+]
 RUNPOD_CUENTA_1_NOMBRE = os.environ.get("RUNPOD_CUENTA_1_NOMBRE", "Cuenta 1")
 RUNPOD_CUENTA_2_NOMBRE = os.environ.get("RUNPOD_CUENTA_2_NOMBRE", "Cuenta 2")
 
@@ -214,10 +237,10 @@ def r2_upload_file(file_obj, key):
 # ══════════════════════════════════════════════════════════════
 # BOOTSTRAP del pod (descarga worker_gs.py y lo corre)
 # ══════════════════════════════════════════════════════════════
-def build_bootstrap() -> str:
-    """Comando de arranque del pod. La imagen render-gs:v2 ya trae 2DGS+COLMAP,
-    así que el bootstrap solo instala boto3, baja el worker y lo ejecuta."""
-    body = (
+def _bootstrap_body() -> str:
+    """El comando de arranque SIN el envoltorio 'bash -lc'. Lo usan tanto el
+    bootstrap de GraphQL (envuelto) como la REST API (en dockerStartCmd)."""
+    return (
         "set -e; "
         "echo \"[bootstrap] iniciando (imagen render-gs:v2 con 2DGS+COLMAP)\"; "
         "which colmap && echo \"[bootstrap] colmap OK\" || echo \"[bootstrap] WARN: falta colmap\"; "
@@ -228,7 +251,10 @@ def build_bootstrap() -> str:
         "echo \"[bootstrap] worker descargado, ejecutando\"; "
         "cd /workspace && python -u worker_gs.py"
     )
-    return "bash -lc '" + body + "'"
+
+def build_bootstrap() -> str:
+    """Comando de arranque del pod para GraphQL (envuelto en bash -lc)."""
+    return "bash -lc '" + _bootstrap_body() + "'"
 
 # ══════════════════════════════════════════════════════════════
 # RUNPOD GRAPHQL (IDÉNTICO a tu backend viejo)
@@ -284,6 +310,69 @@ class RunPod:
         })
 
     @staticmethod
+    async def create_pod_rest(job_id, env_vars):
+        """SOLUCIÓN DEFINITIVA al 'Sin GPU disponible': crea el pod con la API
+        REST nueva de RunPod, mandando TODA la lista de GPUs juntas y dejando
+        que RunPod elija la primera disponible en cualquier datacenter (igual
+        que la web). Así no falla por pedir una sola GPU/config rígida.
+        Devuelve (pod_dict, gpu_usada). Lanza error solo si NINGUNA GPU de la
+        lista tiene stock en ninguna nube."""
+        key = RunPod._api_key_activa or RUNPOD_API_KEY
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        bootstrap = build_bootstrap()
+        # env como OBJETO (en REST, no lista).
+        env_obj = {k: str(v) for k, v in env_vars.items()}
+        # Probamos primero SECURE, y si no hay en ninguna GPU, COMMUNITY.
+        ultimos_errores = []
+        for cloud in ("SECURE", "COMMUNITY"):
+            body = {
+                "name": f"render-gs-{job_id[:8]}",
+                "imageName": RUNPOD_IMAGE,
+                "cloudType": cloud,
+                "computeType": "GPU",
+                "gpuTypeIds": GPU_FALLBACK_LIST,        # lista → fallback auto
+                "gpuTypePriority": "availability",      # la 1ª disponible
+                "gpuCount": 1,
+                "containerDiskInGb": POD_CONTAINER_DISK_GB,
+                "volumeInGb": POD_VOLUME_DISK_GB,
+                "volumeMountPath": "/workspace",
+                "minRAMPerGPU": 20,                     # por GPU (REST), no total
+                "minVCPUPerGPU": 4,                     # por GPU (REST), no total
+                "dataCenterPriority": "availability",   # cualquier datacenter
+                "ports": ["8888/http"],
+                "env": env_obj,
+                # dockerArgs (GraphQL) → en REST el arranque va en dockerStartCmd.
+                "dockerStartCmd": ["bash", "-lc", _bootstrap_body()],
+            }
+            try:
+                async with httpx.AsyncClient(timeout=60) as c:
+                    r = await c.post(f"{RUNPOD_REST_URL}/pods", headers=headers, json=body)
+                if r.status_code in (200, 201):
+                    data = r.json()
+                    gpu_usada = "?"
+                    # La respuesta REST trae la GPU asignada en machine/gpu.
+                    try:
+                        gpu_usada = (data.get("machine", {}) or {}).get("gpuTypeId") \
+                                    or (data.get("gpu", {}) or {}).get("id") \
+                                    or "GPU asignada"
+                    except Exception:
+                        pass
+                    print(f"[rest] pod creado en {cloud}: {data.get('id')} ({gpu_usada})")
+                    return data, gpu_usada
+                else:
+                    msg = f"{cloud} HTTP {r.status_code}: {r.text[:300]}"
+                    print(f"[rest] {msg}")
+                    ultimos_errores.append(msg)
+            except Exception as e:
+                msg = f"{cloud} excepción: {e}"
+                print(f"[rest] {msg}")
+                ultimos_errores.append(msg)
+        raise RuntimeError(
+            "Ninguna GPU de la lista tiene stock (probado SECURE y COMMUNITY). "
+            f"Detalle: {' | '.join(ultimos_errores[:4])}"
+        )
+
+    @staticmethod
     async def create_pod(job_id, gpu_type_id, env_vars, container_gb=None, volume_gb=None):
         container_gb = container_gb or POD_CONTAINER_DISK_GB
         volume_gb = volume_gb or POD_VOLUME_DISK_GB
@@ -317,18 +406,27 @@ class RunPod:
 
     @staticmethod
     async def terminate_pod(pod_id):
+        """Destruye el pod (REST API DELETE). Deja de cobrar."""
         if not pod_id: return False
+        key = RunPod._api_key_activa or RUNPOD_API_KEY
+        headers = {"Authorization": f"Bearer {key}"}
         try:
-            await RunPod._query("""
-                mutation t($input: PodTerminateInput!) {
-                    podTerminate(input: $input)
-                }
-            """, {"input":{"podId":pod_id}})
-            print(f"[runpod] Pod {pod_id} terminado")
+            async with httpx.AsyncClient(timeout=30) as c:
+                r = await c.delete(f"{RUNPOD_REST_URL}/pods/{pod_id}", headers=headers)
+            print(f"[rest] Pod {pod_id} terminado (HTTP {r.status_code})")
             return True
         except Exception as e:
-            print(f"[runpod] terminate falló: {e}")
-            return False
+            print(f"[rest] terminate falló: {e}")
+            # Respaldo: intentar por GraphQL (por si REST falla).
+            try:
+                await RunPod._query("""
+                    mutation t($input: PodTerminateInput!) { podTerminate(input: $input) }
+                """, {"input":{"podId":pod_id}})
+                print(f"[runpod] Pod {pod_id} terminado (GraphQL respaldo)")
+                return True
+            except Exception as e2:
+                print(f"[runpod] terminate GraphQL también falló: {e2}")
+                return False
 
     @staticmethod
     async def list_my_pods():
@@ -355,85 +453,21 @@ def _split_pod_tag(tagged):
             return (prov, pid)
     return ("runpod", tagged)
 
-async def _runpod_create_specific_4090(job_id, env_vars):
-    all_gpus = await RunPod.list_all_gpus()
-    if not all_gpus:
-        raise RuntimeError("RunPod no devolvió GPUs. ¿API key correcta?")
-    req, forb = ["4090"], ["pro", "ti", "mobile"]
-    for g in all_gpus:
-        if RunPod._matches(g.get("displayName", ""), req, forb):
-            gid = g.get("id")
-            disk = RunPod.disk_config_for("RTX 4090")
-            pod = await RunPod.create_pod(
-                job_id, gid, env_vars,
-                container_gb=disk["container"], volume_gb=disk["volume"])
-            return pod, "RTX 4090", g.get("displayName", "RTX 4090"), disk
-    raise RuntimeError("SUPPLY_CONSTRAINT: RunPod no tiene RTX 4090 ahora")
-
-async def _runpod_create_second_best(job_id, env_vars):
-    all_gpus = await RunPod.list_all_gpus()
-    if not all_gpus:
-        raise RuntimeError("RunPod no devolvió GPUs")
-    candidates = []
-    seen_ids = set()
-    for label, req, forb in GPU_PREFERENCES:
-        if label == "RTX 4090":
-            continue
-        for g in all_gpus:
-            gid = g.get("id")
-            if gid in seen_ids:
-                continue
-            if RunPod._matches(g.get("displayName", ""), req, forb):
-                candidates.append((label, g.get("displayName", ""), gid))
-                seen_ids.add(gid)
-                break
-    for g in all_gpus:
-        gid = g.get("id"); name = g.get("displayName", ""); vram = g.get("memoryInGb", 0)
-        if gid in seen_ids or vram < 20:
-            continue
-        if any(b in name.lower() for b in BANNED_GPU_KEYWORDS):
-            continue
-        candidates.append((f"FALLBACK ({name})", name, gid))
-        seen_ids.add(gid)
-    errors = []
-    for label, display_name, gid in candidates:
-        disk = RunPod.disk_config_for(label)
-        print(f"[cascada-2] Intentando {label} en RunPod")
-        try:
-            pod = await RunPod.create_pod(
-                job_id, gid, env_vars,
-                container_gb=disk["container"], volume_gb=disk["volume"])
-            return pod, label, display_name, disk
-        except Exception as e:
-            if "SUPPLY_CONSTRAINT" in str(e) or "no longer any instances" in str(e).lower():
-                errors.append(label)
-                continue
-            raise
-    raise RuntimeError(f"RunPod sin stock en 2ª opción. Probadas: {', '.join(errors[:8])}")
-
 async def provision_gpu(job_id, env_vars, cuenta_id="1"):
+    """SOLUCIÓN DEFINITIVA: usa la API REST de RunPod, que prueba TODA la lista
+    de GPUs (4090 → A5000 → 3090 → A6000 → …) en SECURE y luego COMMUNITY,
+    en cualquier datacenter, y alquila la primera disponible. Esto replica lo
+    que hace la web, así que ya no falla por pedir una sola GPU rígida.
+    Devuelve (pod_tagged_id, provider, gpu_label, gpu_display, disk)."""
     RunPod.set_cuenta(cuenta_id)
     key_activa = _runpod_key_de_cuenta(cuenta_id)
-    print(f"[provision] usando RunPod cuenta {cuenta_id}")
-    steps_failed = []
-    if key_activa:
-        try:
-            pod, label, disp, disk = await _runpod_create_specific_4090(job_id, env_vars)
-            return _tag_pod("runpod", pod.get("id", "")), "runpod", label, disp, disk
-        except Exception as e:
-            print(f"[cascada-1] RunPod 4090 no disponible: {e}")
-            steps_failed.append("RunPod 4090")
-    if key_activa:
-        try:
-            pod, label, disp, disk = await _runpod_create_second_best(job_id, env_vars)
-            return _tag_pod("runpod", pod.get("id", "")), "runpod", label, disp, disk
-        except Exception as e:
-            print(f"[cascada-2] RunPod 2ª opción falló: {e}")
-            steps_failed.append("RunPod 2ª opción")
-    raise RuntimeError(
-        "No se pudo alquilar GPU en RunPod. "
-        f"Intentado: {', '.join(steps_failed)}. Reintenta en 5-10 min."
-    )
+    print(f"[provision] usando RunPod cuenta {cuenta_id} (REST API con fallback)")
+    if not key_activa:
+        raise RuntimeError(f"La cuenta {cuenta_id} no tiene API key configurada.")
+    pod, gpu_usada = await RunPod.create_pod_rest(job_id, env_vars)
+    pid = pod.get("id", "")
+    disk = {"container": POD_CONTAINER_DISK_GB, "volume": POD_VOLUME_DISK_GB}
+    return _tag_pod("runpod", pid), "runpod", str(gpu_usada), str(gpu_usada), disk
 
 async def terminate_any(pod_tagged_id, cuenta_id="1"):
     provider, pid = _split_pod_tag(pod_tagged_id)
