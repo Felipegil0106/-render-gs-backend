@@ -41,11 +41,10 @@ RUNPOD_API_URL      = "https://api.runpod.io/graphql"
 # API REST nueva de RunPod (la recomendada). Resuelve el "Sin GPU disponible"
 # probando varias GPUs y datacenters automáticamente, como hace la web.
 RUNPOD_REST_URL     = "https://rest.runpod.io/v1"
-# Lista de GPUs EN ORDEN JERÁRQUICO (igual que tu backend viejo: de mejor a
-# aceptable). Con gpuTypePriority='availability', RunPod recorre esta lista
-# DE ARRIBA HACIA ABAJO y alquila la PRIMERA que tenga stock. Es decir, SIEMPRE
-# intenta la 4090 primero; si no hay, la A6000; si no, la 6000 Ada; y así.
-# El orden de esta lista ES la jerarquía y se respeta siempre.
+# Lista de GPUs EN ORDEN JERÁRQUICO (de mejor a aceptable). Con
+# gpuTypePriority='custom', RunPod sigue este orden ESTRICTO: intenta la 4090
+# primero; SOLO si no hay stock, pasa a la A6000; luego la 6000 Ada; y así.
+# Así siempre te dan la 4090 cuando está disponible.
 GPU_FALLBACK_LIST = [
     "NVIDIA GeForce RTX 4090",            # 1º preferida
     "NVIDIA RTX A6000",                   # 2º
@@ -330,8 +329,10 @@ class RunPod:
                 "name": f"render-gs-{job_id[:8]}",
                 "imageName": RUNPOD_IMAGE,
                 "cloudType": cloud,
-                "gpuTypeIds": GPU_FALLBACK_LIST,        # lista en orden → fallback
-                "gpuTypePriority": "availability",      # la 1ª disponible (respeta orden)
+                "gpuTypeIds": GPU_FALLBACK_LIST,        # lista en orden de preferencia
+                "gpuTypePriority": "custom",            # 'custom' = sigue MI orden estricto
+                #   (intenta la 4090; SOLO si no hay, pasa a la siguiente, etc.)
+                #   A diferencia de 'availability', que elegía por stock y daba A40.
                 "gpuCount": 1,
                 "containerDiskInGb": POD_CONTAINER_DISK_GB,
                 "volumeInGb": POD_VOLUME_DISK_GB,
