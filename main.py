@@ -138,8 +138,14 @@ if not CALLBACK_SECRET:
     CALLBACK_SECRET = uuid.uuid4().hex
     print("[WARN] CALLBACK_SECRET no estaba seteado, generado uno nuevo")
 
-# Watchdog (igual que el viejo)
-POD_MAX_LIFETIME_MIN      = 90
+# Watchdog
+# SUBIDO de 90 a 150 min: ahora entrenamos 30000 iteraciones (antes 15000), que
+# en una GPU lenta (A6000) tardan ~85 min de entrenamiento + COLMAP + malla =
+# ~100-105 min total. Con 90 min el pod se mataba a mitad. 150 da margen.
+# El watchdog de LATIDO (30 min sin señal = matar) sigue protegiendo contra
+# cuelgues reales: aunque el límite total sea 150, un pod colgado muere a los
+# 30 min. Así subir el total NO arriesga costos por pods zombi.
+POD_MAX_LIFETIME_MIN      = 150
 POD_HEARTBEAT_TIMEOUT_MIN = 30
 WATCHDOG_INTERVAL_SEC     = 300
 PORT = int(os.environ.get("PORT", "8000"))
