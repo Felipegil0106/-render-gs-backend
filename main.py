@@ -76,7 +76,7 @@ def _runpod_key_de_cuenta(cuenta_id):
     return RUNPOD_API_KEY
 
 # ── CAMBIO 1: imagen NUEVA (2DGS + COLMAP) en vez de la vieja ──
-RUNPOD_IMAGE        = os.environ.get("RUNPOD_IMAGE", "felipegil0106/render-gs:v3")
+RUNPOD_IMAGE        = os.environ.get("RUNPOD_IMAGE", "felipegil0106/gaussian-mesh:v2")
 
 # Config del pod — AJUSTADO para caber en 4090 con 40GB de disco total.
 # Antes pedíamos 60+100=160GB y RunPod rechazaba las 4090 (solo tienen 40GB).
