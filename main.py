@@ -27,7 +27,8 @@ from contextlib import contextmanager
 import boto3
 from botocore.config import Config
 import httpx
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header
+from fastapi import (FastAPI, UploadFile, File, Form, HTTPException, Request,
+                     Header, BackgroundTasks)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
@@ -243,7 +244,18 @@ def r2_upload_file(file_obj, key):
 # ══════════════════════════════════════════════════════════════
 def _bootstrap_body() -> str:
     """El comando de arranque SIN el envoltorio 'bash -lc'. Lo usan tanto el
-    bootstrap de GraphQL (envuelto) como la REST API (en dockerStartCmd)."""
+    bootstrap de GraphQL (envuelto) como la REST API (en dockerStartCmd).
+
+    ═══ BLINDAJE ANTI-BUCLE-DE-REINICIO (quemaba crédito en silencio) ═══
+    FALLO REAL: el worker se llamaba 'worker' en GitHub (sin .py) y este script
+    pedía 'worker_gs.py' -> 404. Como el wget era '-q' (silencioso) y el script
+    tenía 'set -e', el pod MORÍA SIN DECIR NADA, RunPod lo relanzaba, y así en
+    bucle infinito cobrando GPU. En el log solo se veía '[bootstrap] 2DGS OK'
+    una y otra vez.
+    AHORA: (1) el wget NO es silencioso y reintenta; (2) si falla, prueba los
+    nombres alternativos; (3) se VERIFICA que el archivo bajó, pesa lo normal y
+    es Python válido; (4) si algo falla, se imprime un ERROR ENORME y visible
+    diciendo exactamente qué pasa y cómo arreglarlo (en vez de morir mudo)."""
     return (
         "set -e; "
         "echo \"[bootstrap] iniciando worker\"; "
@@ -251,9 +263,38 @@ def _bootstrap_body() -> str:
         "test -x /usr/local/bin/OpenMVS/TextureMesh && echo \"[bootstrap] OpenMVS PRESENTE OK\" || echo \"[bootstrap] ERROR: NO hay OpenMVS - imagen v2 vieja, reconstruye v3!\"; "
         "which colmap && echo \"[bootstrap] colmap OK\" || echo \"[bootstrap] WARN: falta colmap\"; "
         "python -c \"import diff_surfel_rasterization; print(\\\"[bootstrap] 2DGS OK\\\")\" || echo \"[bootstrap] WARN: falta 2DGS\"; "
-        "pip install --no-cache-dir boto3==1.34.34 >/dev/null 2>&1 || pip install boto3; "
+        # pip: ya NO silenciado (antes ocultaba su propio fallo)
+        "echo \"[bootstrap] instalando boto3...\"; "
+        "pip install --no-cache-dir boto3==1.34.34 2>&1 | tail -1 || pip install boto3 2>&1 | tail -1 || true; "
         "mkdir -p /workspace; "
-        f"wget -q -O /workspace/worker_gs.py \"{WORKER_SCRIPT_URL}\"; "
+        # descarga RUIDOSA, con reintentos y con nombres alternativos de respaldo
+        "echo \"[bootstrap] descargando worker...\"; "
+        "set +e; "
+        f"wget --tries=3 --timeout=25 -O /workspace/worker_gs.py \"{WORKER_SCRIPT_URL}\" 2>&1 | tail -2; "
+        "OK=0; "
+        "if [ -s /workspace/worker_gs.py ]; then OK=1; fi; "
+        "if [ $OK -eq 0 ]; then "
+        f"  echo \"[bootstrap] AVISO: no encontre worker_gs.py, pruebo nombre alternativo 'worker'\"; "
+        f"  wget --tries=3 --timeout=25 -O /workspace/worker_gs.py \"{WORKER_SCRIPT_URL.rsplit('/',1)[0]}/worker\" 2>&1 | tail -2; "
+        "  if [ -s /workspace/worker_gs.py ]; then OK=1; fi; "
+        "fi; "
+        "set -e; "
+        # VERIFICACION: existe, pesa lo normal, y es Python valido
+        "SZ=$(stat -c%s /workspace/worker_gs.py 2>/dev/null || echo 0); "
+        "echo \"[bootstrap] worker descargado: $SZ bytes\"; "
+        "if [ \"$SZ\" -lt 10000 ]; then "
+        "  echo \"##############################################################\"; "
+        f"  echo \"# ERROR FATAL: no pude descargar el worker desde GitHub.\"; "
+        f"  echo \"# URL: {WORKER_SCRIPT_URL}\"; "
+        "  echo \"# El archivo bajo con $SZ bytes (deberia pesar ~100000).\"; "
+        "  echo \"# CAUSA TIPICA: el archivo en GitHub NO se llama worker_gs.py\"; "
+        "  echo \"#   (revisa el repo render-gs-worker y renombralo a worker_gs.py)\"; "
+        "  echo \"# APAGA ESTE POD: sin worker no puede hacer nada y cobra GPU.\"; "
+        "  echo \"##############################################################\"; "
+        "  exit 1; "
+        "fi; "
+        "python -c \"import ast,sys; ast.parse(open('/workspace/worker_gs.py').read()); print('[bootstrap] worker es Python valido OK')\" || "
+        "  { echo \"ERROR FATAL: el worker descargado NO es Python valido (revisa el archivo en GitHub)\"; exit 1; }; "
         "echo \"[bootstrap] worker descargado, ejecutando\"; "
         "cd /workspace && python -u worker_gs.py"
     )
@@ -327,9 +368,27 @@ class RunPod:
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         # env como OBJETO (en REST, no lista).
         env_obj = {k: str(v) for k, v in env_vars.items()}
-        # Probamos primero SECURE, y si no hay en ninguna GPU, COMMUNITY.
+        # ═══ POR QUÉ NUNCA CAÍA LA 4090 (bug encontrado) ═══
+        # El código viejo hacía: for cloud in ("SECURE","COMMUNITY") mandando la
+        # LISTA COMPLETA de GPUs en cada nube. El problema: las RTX 4090 son
+        # tarjetas de consumo y viven casi todas en la nube COMMUNITY; la nube
+        # SECURE tiene tarjetas de datacenter (A6000, A40, L40, A100).
+        # Resultado: en SECURE no había 4090 -> RunPod bajaba a la 2ª de la lista
+        # (A6000) -> creaba el pod -> y NUNCA llegaba a mirar COMMUNITY, que es
+        # justo donde SÍ estaba la 4090. Por eso siempre te tocaba A6000 (el
+        # doble de lenta: 30 min de entrenamiento vs 15 de la 4090).
+        # ARREGLO: la prioridad de GPU manda sobre la de nube. Primero buscamos
+        # la 4090 SOLA en las DOS nubes (COMMUNITY primero, que es su hábitat);
+        # solo si no hay 4090 en NINGUNA parte, se cae a la lista completa.
+        SOLO_4090 = ["NVIDIA GeForce RTX 4090"]
+        intentos = [
+            (SOLO_4090,          "COMMUNITY"),   # 1º: la 4090 donde de verdad vive
+            (SOLO_4090,          "SECURE"),      # 2º: la 4090 por si hubiera en secure
+            (GPU_FALLBACK_LIST,  "SECURE"),      # 3º: ya sin 4090, la jerarquía normal
+            (GPU_FALLBACK_LIST,  "COMMUNITY"),   # 4º
+        ]
         ultimos_errores = []
-        for cloud in ("SECURE", "COMMUNITY"):
+        for gpu_ids, cloud in intentos:
             # Body con SOLO los campos que el esquema REST de RunPod acepta.
             # (Quitamos computeType, dataCenterPriority, minRAMPerGPU/minVCPUPerGPU
             #  y volumeMountPath, que provocaban el error 400 de esquema.)
@@ -337,7 +396,7 @@ class RunPod:
                 "name": f"render-gs-{job_id[:8]}",
                 "imageName": RUNPOD_IMAGE,
                 "cloudType": cloud,
-                "gpuTypeIds": GPU_FALLBACK_LIST,        # lista en orden de preferencia
+                "gpuTypeIds": gpu_ids,                  # ← la lista DE ESTE INTENTO
                 "gpuTypePriority": "custom",            # 'custom' = sigue MI orden estricto
                 #   (intenta la 4090; SOLO si no hay, pasa a la siguiente, etc.)
                 #   A diferencia de 'availability', que elegía por stock y daba A40.
@@ -349,6 +408,8 @@ class RunPod:
                 "env": env_obj,
                 "dockerStartCmd": ["bash", "-lc", _bootstrap_body()],
             }
+            _etq = "SOLO RTX 4090" if gpu_ids is SOLO_4090 else "lista completa"
+            print(f"[rest] intento: {_etq} en nube {cloud}...")
             try:
                 async with httpx.AsyncClient(timeout=60) as c:
                     r = await c.post(f"{RUNPOD_REST_URL}/pods", headers=headers, json=body)
@@ -528,8 +589,30 @@ async def debug_gpus(cuenta: str = "1"):
         "coincidencias_ranking": matched,
     }
 
+async def _arrancar_pod(job_id: str, env: dict, cuenta_runpod: str, quality: str):
+    """Alquila la GPU EN SEGUNDO PLANO (fuera de la petición HTTP).
+    CAUSA DEL 502: antes esto se hacía DENTRO de POST /api/jobs, así que la
+    petición del navegador tenía que esperar a que RunPod alquilara el pod
+    (hasta 2 min: prueba SECURE y luego COMMUNITY con 60s de timeout cada una).
+    Railway corta las peticiones que tardan demasiado -> 502 upstream error.
+    Ahora la petición responde apenas el ZIP está en R2, y el pod se alquila
+    aparte. El frontend ya consulta /api/jobs/{id} en bucle, así que ve el
+    cambio de estado igual."""
+    try:
+        pod_tagged, provider, gpu_label, gpu_displayname, disk = \
+            await provision_gpu(job_id, env, cuenta_id=cuenta_runpod)
+        job_update(job_id, status="processing",
+                   pod_id=pod_tagged,
+                   gpu_type=gpu_displayname,
+                   message=f"GPU {gpu_label} arrancando (~1 min)")
+    except Exception as e:
+        job_update(job_id, status="error", error=f"Sin GPU: {e}",
+                   message=f"Sin GPU disponible: {e}")
+
+
 @app.post("/api/jobs")
-async def create_job(file: UploadFile = File(...), quality: str = Form("fast"),
+async def create_job(background: BackgroundTasks,
+                     file: UploadFile = File(...), quality: str = Form("fast"),
                      cuenta_runpod: str = Form("1")):
     if quality not in ("fast","balanced","quality"):
         quality = "fast"
@@ -547,7 +630,13 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast"),
         """, (job_id,"uploading",quality,now,now,ply_key,now,0.0,"Subiendo a R2"))
     job_update(job_id, runpod_cuenta=cuenta_runpod)
     try:
-        r2_upload_file(file.file, zip_key)
+        # CAUSA DEL 502 (parte 2): r2_upload_file es una llamada BLOQUEANTE de
+        # boto3. Al ejecutarla dentro de un "async def", CONGELA el servidor
+        # entero mientras suben los 44 MB: FastAPI no puede responder a nada,
+        # ni siquiera al chequeo de salud de Railway -> Railway cree que la app
+        # murió, la reinicia y la petición en curso se cae con 502.
+        # asyncio.to_thread la manda a un hilo aparte: el servidor sigue vivo.
+        await asyncio.to_thread(r2_upload_file, file.file, zip_key)
     except Exception as e:
         job_update(job_id, status="error", error=f"R2 upload falló: {e}")
         raise HTTPException(500, f"R2 falló: {e}")
@@ -560,19 +649,16 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast"),
         "CALLBACK_SECRET": CALLBACK_SECRET,
         "QUALITY": quality,
     }
-    try:
-        pod_tagged, provider, gpu_label, gpu_displayname, disk = \
-            await provision_gpu(job_id, env, cuenta_id=cuenta_runpod)
-    except Exception as e:
-        job_update(job_id, status="error", error=f"Sin GPU: {e}")
-        raise HTTPException(503, f"Sin GPU disponible: {e}")
-    job_update(job_id, status="processing",
-               pod_id=pod_tagged,
-               gpu_type=gpu_displayname,
-               message=f"GPU {gpu_label} arrancando (~1 min)")
-    return {"job_id":job_id, "status":"processing", "quality":quality,
-            "pod_id":pod_tagged, "provider":provider, "cuenta_runpod":cuenta_runpod,
-            "gpu_type":gpu_displayname, "gpu_label":gpu_label}
+    # El ZIP YA está a salvo en R2 -> respondemos AL INSTANTE y alquilamos la
+    # GPU en segundo plano. Así la petición dura segundos (no minutos) y Railway
+    # no la corta. El frontend ya consulta /api/jobs/{id} y verá el estado pasar
+    # a "processing" en cuanto el pod exista (o a "error" si no hubiera GPU).
+    job_update(job_id, status="uploading", progress=0.02,
+               message="ZIP en R2 · buscando GPU (RTX 4090 primero)…")
+    background.add_task(_arrancar_pod, job_id, env, cuenta_runpod, quality)
+    return {"job_id":job_id, "status":"uploading", "quality":quality,
+            "pod_id":None, "provider":"runpod", "cuenta_runpod":cuenta_runpod,
+            "gpu_type":None, "gpu_label":"buscando GPU…"}
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
