@@ -76,7 +76,7 @@ def _runpod_key_de_cuenta(cuenta_id):
     return RUNPOD_API_KEY
 
 # ── CAMBIO 1: imagen NUEVA (2DGS + COLMAP) en vez de la vieja ──
-RUNPOD_IMAGE        = os.environ.get("RUNPOD_IMAGE", "felipegil0106/gaussian-mesh:v3")
+RUNPOD_IMAGE        = os.environ.get("RUNPOD_IMAGE", "felipegil0106/gaussian-mesh:v2")
 
 # Config del pod — AJUSTADO para caber en 4090 con 40GB de disco total.
 # Antes pedíamos 60+100=160GB y RunPod rechazaba las 4090 (solo tienen 40GB).
@@ -246,9 +246,7 @@ def _bootstrap_body() -> str:
     bootstrap de GraphQL (envuelto) como la REST API (en dockerStartCmd)."""
     return (
         "set -e; "
-        "echo \"[bootstrap] iniciando worker\"; "
-        "test -d /opt/mast3r && echo \"[bootstrap] MASt3R PRESENTE OK (imagen correcta v3)\" || echo \"[bootstrap] ERROR: NO hay MASt3R - imagen vieja sin actualizar!\"; "
-        "test -x /usr/local/bin/OpenMVS/TextureMesh && echo \"[bootstrap] OpenMVS PRESENTE OK\" || echo \"[bootstrap] ERROR: NO hay OpenMVS - imagen v2 vieja, reconstruye v3!\"; "
+        "echo \"[bootstrap] iniciando (imagen render-gs:v1 con 2DGS+COLMAP)\"; "
         "which colmap && echo \"[bootstrap] colmap OK\" || echo \"[bootstrap] WARN: falta colmap\"; "
         "python -c \"import diff_surfel_rasterization; print(\\\"[bootstrap] 2DGS OK\\\")\" || echo \"[bootstrap] WARN: falta 2DGS\"; "
         "pip install --no-cache-dir boto3==1.34.34 >/dev/null 2>&1 || pip install boto3; "
@@ -538,7 +536,7 @@ async def create_job(file: UploadFile = File(...), quality: str = Form("fast"),
     job_id = str(uuid.uuid4())[:12]
     now = datetime.now(timezone.utc).isoformat()
     zip_key = f"uploads/{job_id}/input.zip"
-    ply_key = f"results/{job_id}/mesh_2dgs.glb"
+    ply_key = f"results/{job_id}/mesh_2dgs.ply"
     with get_db() as db:
         db.execute("""
             INSERT INTO jobs (id,status,quality,created_at,updated_at,ply_key,
@@ -756,7 +754,7 @@ select{background:#2a2a2a;color:#eee}
 </style></head><body>
 <div class="container">
   <h1>🧪 Render-GS — Prueba 2DGS</h1>
-  <p class="subtitle">Sube el ZIP · se alquila sola la RTX 4090 (o la siguiente en la lista) · entrega malla .glb con textura</p>
+  <p class="subtitle">Sube el ZIP · se alquila sola la RTX 4090 (o la siguiente en la lista) · entrega malla .ply</p>
   <div class="card" id="upload-card">
     <div id="dropzone">
       <div class="icon">📦</div>
@@ -774,7 +772,7 @@ select{background:#2a2a2a;color:#eee}
     <div class="bar"><div class="bar-fill" id="barFill" style="width:0%"></div></div>
     <div class="log-box" id="logBox">Iniciando...</div>
     <div id="resultActions" class="hidden">
-      <button class="btn-success hidden" id="viewBtn">⬇️ Descargar malla (.glb)</button>
+      <button class="btn-success hidden" id="viewBtn">⬇️ Descargar malla (.ply)</button>
       <button class="btn-download hidden" id="logBtn">📄 Ver / descargar log</button>
       <button class="btn-primary" id="newBtn">🔄 Probar otro ZIP</button>
     </div>
