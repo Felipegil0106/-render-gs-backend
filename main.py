@@ -990,28 +990,54 @@ btn.onclick=async()=>{if(!sel)return;up.classList.add('hidden');pr.style.display
     addLog('Esperando arranque del pod... luego COLMAP + 2DGS');
     st.innerHTML='<span class="spinner"></span>Pod arrancando...';startPoll()
   }catch(e){addLog('❌ '+e.message);st.className='status error';st.textContent='❌ Error';showNew()}};
+// Nunca revienta con "Unexpected token": si la respuesta no es JSON valido
+// (p.ej. el 502 'upstream error' de texto plano de Railway) devuelve null.
+function safeJson(r){return (r&&r.ok)?r.json().catch(function(){return null}):Promise.resolve(null)}
+// Descarga tolerante: intenta /download y, si falla, cae a la ruta de rescate
+// que arma el enlace DIRECTO desde R2 sin mirar la BD.
+function openDownload(){return (async()=>{
+  let dd=await safeJson(await fetch('/api/jobs/'+jid+'/download'));
+  if(dd&&dd.ply_url){window.open(dd.ply_url,'_blank');return}
+  dd=await safeJson(await fetch('/api/rescue/'+jid));
+  if(dd&&dd.listo&&dd.url){window.open(dd.url,'_blank');return}
+  alert('No pude obtener el enlace ahora. Reintenta en unos segundos.')})()}
+// FUENTE DE VERDAD = el archivo en R2. Si ya esta subido, damos por terminado
+// aunque la BD diga error o las consultas fallen (asi se recupera el caso real:
+// worker termino y subio el .glb, pero la pagina veia 'upstream error'/error).
+async function checkR2(){
+  const dd=await safeJson(await fetch('/api/rescue/'+jid));
+  if(dd&&dd.listo&&dd.url){clearInterval(timer);
+    addLog('');addLog('✅ MALLA LISTA (recuperada desde R2)');
+    st.className='status success';st.textContent='✅ ¡Completado!';bf.style.width='100%';
+    ra.classList.remove('hidden');vb.classList.remove('hidden');vb.onclick=openDownload;
+    lgb.textContent='📄 Ver / descargar log';lgb.classList.remove('hidden');
+    lgb.onclick=()=>window.open('/api/jobs/'+jid+'/log','_blank');showNew();return true}
+  return false}
 function startPoll(){
   timer=setInterval(async()=>{
-    try{const r=await fetch('/api/jobs/'+jid);const j=await r.json();
-      const p=Math.round((j.progress||0)*100);bf.style.width=p+'%';
-      st.innerHTML='<span class="spinner"></span>'+(j.message||'Procesando')+' ('+p+'%)';
-      if(j.status==='completed'){clearInterval(timer);
-        addLog('');addLog('✅ MALLA LISTA');
-        addLog('Frames: '+(j.frames_used||'?')+' · '+(j.ply_mb||'?')+' MB · '+(j.seconds||'?')+'s');
-        st.className='status success';st.textContent='✅ ¡Completado!';bf.style.width='100%';
-        ra.classList.remove('hidden');vb.classList.remove('hidden');
-        vb.onclick=async()=>{const dr=await fetch('/api/jobs/'+jid+'/download');const dd=await dr.json();
-          window.open(dd.ply_url,'_blank')};
-        lgb.textContent='📄 Ver / descargar log';lgb.classList.remove('hidden');
-        lgb.onclick=()=>window.open('/api/jobs/'+jid+'/log','_blank');showNew()
-      }else if(j.status==='error'){clearInterval(timer);
-        addLog('');addLog('❌ ERROR: '+(j.error||'sin detalle'));
-        st.className='status error';st.textContent='❌ Falló';
-        ra.classList.remove('hidden');vb.classList.add('hidden');
-        lgb.textContent='📄 Descargar log del error';lgb.classList.remove('hidden');
-        lgb.onclick=()=>window.open('/api/jobs/'+jid+'/log','_blank');showNew()
-      }
-    }catch(e){addLog('⚠ '+e.message)}
+    let j=null;
+    try{j=await safeJson(await fetch('/api/jobs/'+jid))}catch(e){j=null}
+    if(!j){ // 502 'upstream error' / reinicio de Railway: NO revienta; reintenta y revisa R2
+      if(await checkR2())return;
+      st.innerHTML='<span class="spinner"></span>Reconectando…';return}
+    const p=Math.round((j.progress||0)*100);bf.style.width=p+'%';
+    st.innerHTML='<span class="spinner"></span>'+(j.message||'Procesando')+' ('+p+'%)';
+    if(j.status==='completed'){clearInterval(timer);
+      addLog('');addLog('✅ MALLA LISTA');
+      addLog('Frames: '+(j.frames_used||'?')+' · '+(j.ply_mb||'?')+' MB · '+(j.seconds||'?')+'s');
+      st.className='status success';st.textContent='✅ ¡Completado!';bf.style.width='100%';
+      ra.classList.remove('hidden');vb.classList.remove('hidden');vb.onclick=openDownload;
+      lgb.textContent='📄 Ver / descargar log';lgb.classList.remove('hidden');
+      lgb.onclick=()=>window.open('/api/jobs/'+jid+'/log','_blank');showNew()
+    }else if(j.status==='error'){ // ANTES de declarar error, revisa R2: el worker pudo terminar y subir el .glb
+      if(await checkR2())return;
+      clearInterval(timer);
+      addLog('');addLog('❌ ERROR: '+(j.error||'sin detalle'));
+      st.className='status error';st.textContent='❌ Falló';
+      ra.classList.remove('hidden');vb.classList.add('hidden');
+      lgb.textContent='📄 Descargar log del error';lgb.classList.remove('hidden');
+      lgb.onclick=()=>window.open('/api/jobs/'+jid+'/log','_blank');showNew()
+    }
   },10000)}
 function showNew(){nb.onclick=()=>location.reload()}
 </script></body></html>"""
