@@ -186,10 +186,14 @@ def init_db():
                 runpod_cuenta TEXT
             )
         """)
+        # splat_key / splat_mb: el SPLAT GAUSSIANO, el entregable nítido para
+        # caminar la casa en primera persona. Se añaden con ALTER TABLE como el
+        # resto, así que una base de datos vieja se migra sola al arrancar.
         for col, typ in [("pod_id","TEXT"),("gpu_type","TEXT"),
                          ("last_heartbeat","TEXT"),("progress","REAL"),
                          ("message","TEXT"),("worker_log","TEXT"),
-                         ("ply_mb","REAL"),("runpod_cuenta","TEXT")]:
+                         ("ply_mb","REAL"),("runpod_cuenta","TEXT"),
+                         ("splat_key","TEXT"),("splat_mb","REAL")]:
             try: db.execute(f"ALTER TABLE jobs ADD COLUMN {col} {typ}")
             except sqlite3.OperationalError: pass
 
@@ -228,9 +232,19 @@ def get_r2():
         region_name="auto",
     )
 
-def r2_put_url(key, expires=7200):
+# ── DURACIÓN DE LAS URLS FIRMADAS ──
+# BUG REAL que esto arregla: las URLs de SUBIDA duraban 7200 s = 2 h, pero
+# POD_MAX_LIFETIME_MIN son 150 min = 2.5 h. En una GPU lenta (A6000: ~105-150
+# min de render) la URL EXPIRABA ANTES DE QUE EL WORKER TERMINARA: el pod hacía
+# el trabajo completo, intentaba subir y el PUT rebotaba. Se pagaba la GPU
+# entera y no quedaba archivo. Ahora la subida dura 5 h — cómodamente por
+# encima de la vida máxima del pod, que es lo que de verdad la acota.
+UPLOAD_URL_EXPIRES = int(os.environ.get("UPLOAD_URL_EXPIRES", str(5 * 3600)))
+
+def r2_put_url(key, expires=None):
     return get_r2().generate_presigned_url(
-        "put_object", Params={"Bucket":R2_BUCKET,"Key":key}, ExpiresIn=expires)
+        "put_object", Params={"Bucket":R2_BUCKET,"Key":key},
+        ExpiresIn=expires or UPLOAD_URL_EXPIRES)
 
 def r2_get_url(key, expires=7200):
     return get_r2().generate_presigned_url(
@@ -555,6 +569,25 @@ def verify_signature(body: bytes, sig: str) -> bool:
 def index():
     return HTML_PAGE
 
+# ══════════════════════════════════════════════════════════════
+# VISOR EN PRIMERA PERSONA (/walk)
+# ══════════════════════════════════════════════════════════════
+# Sirve viewer.html, que renderiza el splat gaussiano y deja CAMINAR la casa
+# con WASD + ratón. Es un archivo suelto (no una string gigante aquí dentro)
+# para poder editarlo sin tocar el backend.
+#   /walk?job=<id>   → resuelve el splat del job contra /api/rescue
+#   /walk?url=<ply>  → abre un .ply cualquiera
+_VIEWER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewer.html")
+
+@app.get("/walk", response_class=HTMLResponse)
+def walk():
+    try:
+        with open(_VIEWER, encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        raise HTTPException(
+            500, "Falta viewer.html junto a main.py. Súbelo al repo del backend.")
+
 @app.get("/api/health")
 def health():
     return {"status":"ok", "time":datetime.now(timezone.utc).isoformat(),
@@ -622,12 +655,14 @@ async def create_job(background: BackgroundTasks,
     now = datetime.now(timezone.utc).isoformat()
     zip_key = f"uploads/{job_id}/input.zip"
     ply_key = f"results/{job_id}/mesh_2dgs.glb"
+    splat_key = f"results/{job_id}/splat.ply"
     with get_db() as db:
         db.execute("""
             INSERT INTO jobs (id,status,quality,created_at,updated_at,ply_key,
-                              last_heartbeat,progress,message)
-            VALUES (?,?,?,?,?,?,?,?,?)
-        """, (job_id,"uploading",quality,now,now,ply_key,now,0.0,"Subiendo a R2"))
+                              splat_key,last_heartbeat,progress,message)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (job_id,"uploading",quality,now,now,ply_key,splat_key,now,0.0,
+              "Subiendo a R2"))
     job_update(job_id, runpod_cuenta=cuenta_runpod)
     try:
         # CAUSA DEL 502 (parte 2): r2_upload_file es una llamada BLOQUEANTE de
@@ -644,7 +679,12 @@ async def create_job(background: BackgroundTasks,
     env = {
         "TOUR_ID": job_id,
         "INPUT_URL": r2_get_url(zip_key, expires=7200),
-        "UPLOAD_URL_PLY": r2_put_url(ply_key, expires=7200),
+        "UPLOAD_URL_PLY": r2_put_url(ply_key),
+        # El worker sube AQUÍ el splat gaussiano, en cuanto termina de entrenar
+        # (o sea ~20 min ANTES que la malla, porque no tiene que esperar al TSDF
+        # ni a la textura). Es su propia URL firmada: no compite con la malla ni
+        # la puede pisar. Un worker viejo simplemente ignora esta variable.
+        "UPLOAD_URL_SPLAT": r2_put_url(splat_key),
         "CALLBACK_URL": f"{BACKEND_URL}/api/internal/callback/{job_id}",
         "CALLBACK_SECRET": CALLBACK_SECRET,
         "QUALITY": quality,
@@ -668,14 +708,30 @@ def rescatar(job_id: str):
     Este endpoint construye la URL de descarga a partir del job_id, SIN mirar la
     base de datos. Uso: /api/rescue/d543a7bb-6b3
     Si el render terminó, devuelve el enlace; si aún no, avisa que no está."""
+    def _mirar(k):
+        """Devuelve (existe, MB). head_object no descarga nada: es una consulta."""
+        try:
+            h = get_r2().head_object(Bucket=R2_BUCKET, Key=k)
+            return True, round(h.get("ContentLength", 0) / 1e6, 1)
+        except Exception:
+            return False, 0.0
     key = f"results/{job_id}/mesh_2dgs.glb"
-    try:
-        get_r2().head_object(Bucket=R2_BUCKET, Key=key)
-    except Exception:
+    skey = f"results/{job_id}/splat.ply"
+    hay_malla, mb_malla = _mirar(key)
+    hay_splat, mb_splat = _mirar(skey)
+    if not hay_malla and not hay_splat:
         return {"job_id": job_id, "listo": False,
                 "mensaje": ("Todavía no hay archivo en R2 para este job. "
                             "Si el render sigue corriendo, espera a que termine.")}
-    return {"job_id": job_id, "listo": True, "url": r2_get_url(key, expires=7200)}
+    # El SPLAT aparece ~20 min antes que la malla (se sube nada más entrenar),
+    # así que este endpoint da por "listo" el job en cuanto exista cualquiera de
+    # los dos y devuelve lo que haya. `url` se mantiene apuntando a la malla para
+    # no romper a nadie que ya dependa de este campo.
+    return {"job_id": job_id, "listo": True,
+            "url": r2_get_url(key, expires=7200) if hay_malla else None,
+            "ply_mb": mb_malla,
+            "splat_url": r2_get_url(skey, expires=7200) if hay_splat else None,
+            "splat_mb": mb_splat}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -709,6 +765,7 @@ def get_job(job_id: str):
         "progress": j.get("progress") or 0, "message": j.get("message") or "",
         "pod_id": j.get("pod_id"), "gpu_type": j.get("gpu_type"),
         "frames_used": j.get("frames_used"), "ply_mb": j.get("ply_mb"),
+        "splat_mb": j.get("splat_mb"),
         "seconds": j.get("seconds"), "error": j.get("error"),
         "has_log": bool(j.get("worker_log")),
     }
@@ -719,10 +776,19 @@ def download_result(job_id: str):
     if not j: raise HTTPException(404, "Job no encontrado")
     if j["status"] != "completed":
         raise HTTPException(400, f"Job no listo (estado: {j['status']})")
+    _sk = j.get("splat_key") or f"results/{job_id}/splat.ply"
+    _hay_splat = False
+    try:
+        get_r2().head_object(Bucket=R2_BUCKET, Key=_sk)
+        _hay_splat = True
+    except Exception:
+        pass          # worker viejo, o el entrenamiento no dejó splat
     return {
         "job_id": job_id,
         "ply_url": r2_get_url(j["ply_key"]),
         "ply_mb": j.get("ply_mb", 0),
+        "splat_url": r2_get_url(_sk) if _hay_splat else None,
+        "splat_mb": j.get("splat_mb", 0),
     }
 
 @app.get("/api/jobs/{job_id}/log", response_class=PlainTextResponse)
@@ -766,10 +832,12 @@ async def worker_callback(job_id: str, request: Request,
             with get_db() as db:
                 db.execute("""
                     INSERT OR IGNORE INTO jobs (id,status,quality,created_at,updated_at,
-                                                ply_key,last_heartbeat,progress,message)
-                    VALUES (?,?,?,?,?,?,?,?,?)
+                                                ply_key,splat_key,last_heartbeat,
+                                                progress,message)
+                    VALUES (?,?,?,?,?,?,?,?,?,?)
                 """, (job_id, "processing", "fast", _now0, _now0,
-                      f"results/{job_id}/mesh_2dgs.glb", _now0, 0.0,
+                      f"results/{job_id}/mesh_2dgs.glb",
+                      f"results/{job_id}/splat.ply", _now0, 0.0,
                       "Job recuperado tras reinicio del backend"))
             print(f"[callback] job {job_id} no estaba en la BD (reinicio de Railway): RECREADO")
             j = job_get(job_id)
@@ -809,6 +877,7 @@ async def worker_callback(job_id: str, request: Request,
         job_update(job_id, status="completed", progress=1.0, message="Completado",
                    frames_used=payload.get("frames_used", 0),
                    ply_mb=payload.get("ply_mb", 0),
+                   splat_mb=payload.get("splat_mb", 0),
                    seconds=payload.get("seconds", 0),
                    worker_log=log_text, last_heartbeat=now)
         if pod_a_matar:
@@ -915,6 +984,7 @@ select{background:#2a2a2a;color:#eee}
 .btn-primary:disabled{opacity:.4;cursor:not-allowed}
 .btn-download{background:#7B61FF;color:#fff;font-weight:bold}
 .btn-success{background:#4CAF50;color:#fff;font-weight:bold}
+.btn-splat{background:linear-gradient(90deg,#FF8A00,#FF3D71);color:#fff;font-weight:bold}
 #progress{display:none}
 .log-box{background:#0a0a0a;border:1px solid #2a2a2a;border-radius:8px;padding:16px;
   font-family:monospace;font-size:12px;color:#9fef9f;height:280px;overflow-y:auto;
@@ -947,6 +1017,7 @@ select{background:#2a2a2a;color:#eee}
     <div class="status processing" id="statusText"><span class="spinner"></span>Procesando...</div>
     <div class="bar"><div class="bar-fill" id="barFill" style="width:0%"></div></div>
     <div class="log-box" id="logBox">Iniciando...</div>
+    <button class="btn-splat hidden" id="splatBtn">✨ Descargar SPLAT (.ply) — el nítido</button>
     <div id="resultActions" class="hidden">
       <button class="btn-success hidden" id="viewBtn">⬇️ Descargar malla (.glb)</button>
       <button class="btn-download hidden" id="logBtn">📄 Ver / descargar log</button>
@@ -962,7 +1033,8 @@ const pr=document.getElementById('progress'),st=document.getElementById('statusT
 const lb=document.getElementById('logBox'),ra=document.getElementById('resultActions');
 const vb=document.getElementById('viewBtn'),lgb=document.getElementById('logBtn');
 const nb=document.getElementById('newBtn'),bf=document.getElementById('barFill');
-let sel=null,jid=null,timer=null;
+const sb=document.getElementById('splatBtn');
+let sel=null,jid=null,timer=null,splatVisto=false;
 (async()=>{try{const r=await fetch('/api/runpod/cuentas');const d=await r.json();
   csel.innerHTML='';
   (d.cuentas||[]).forEach(c=>{const o=document.createElement('option');
@@ -1001,6 +1073,18 @@ function openDownload(){return (async()=>{
   dd=await safeJson(await fetch('/api/rescue/'+jid));
   if(dd&&dd.listo&&dd.url){window.open(dd.url,'_blank');return}
   alert('No pude obtener el enlace ahora. Reintenta en unos segundos.')})()}
+// El SPLAT sale ~20 min antes que la malla (se sube al terminar de entrenar,
+// sin esperar al TSDF ni a la textura). En cuanto R2 lo tiene, aparece el
+// boton: se puede empezar a caminar la casa mientras la malla sigue cociendose.
+async function checkSplat(){
+  if(splatVisto)return;
+  const dd=await safeJson(await fetch('/api/rescue/'+jid));
+  if(dd&&dd.splat_url){splatVisto=true;
+    sb.textContent='✨ Descargar SPLAT (.ply) — '+(dd.splat_mb||'?')+' MB, el nitido';
+    sb.classList.remove('hidden');
+    sb.onclick=()=>window.open(dd.splat_url,'_blank');
+    addLog('✨ SPLAT listo ('+(dd.splat_mb||'?')+' MB) — este es el que se ve nitido.');
+    addLog('   Abrelo en https://superspl.at/editor o playcanvas.com/supersplat')}}
 // FUENTE DE VERDAD = el archivo en R2. Si ya esta subido, damos por terminado
 // aunque la BD diga error o las consultas fallen (asi se recupera el caso real:
 // worker termino y subio el .glb, pero la pagina veia 'upstream error'/error).
@@ -1022,7 +1106,9 @@ function startPoll(){
       st.innerHTML='<span class="spinner"></span>Reconectando…';return}
     const p=Math.round((j.progress||0)*100);bf.style.width=p+'%';
     st.innerHTML='<span class="spinner"></span>'+(j.message||'Procesando')+' ('+p+'%)';
-    if(j.status==='completed'){clearInterval(timer);
+    // a partir del 45% ya entreno: el splat puede estar subido en cualquier momento
+    if(p>=45)checkSplat();
+    if(j.status==='completed'){clearInterval(timer);checkSplat();
       addLog('');addLog('✅ MALLA LISTA');
       addLog('Frames: '+(j.frames_used||'?')+' · '+(j.ply_mb||'?')+' MB · '+(j.seconds||'?')+'s');
       st.className='status success';st.textContent='✅ ¡Completado!';bf.style.width='100%';

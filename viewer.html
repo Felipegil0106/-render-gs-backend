@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Caminar la casa — Render-GS</title>
+<!--
+  ════════════════════════════════════════════════════════════════════════
+  VISOR DE SPLATS GAUSSIANOS EN PRIMERA PERSONA
+  ════════════════════════════════════════════════════════════════════════
+  Renderiza el splat.ply que produce el worker y deja CAMINAR la casa con
+  WASD + ratón, como un videojuego.
+
+  POR QUÉ ESTO Y NO EL .glb:
+  la malla texturizada es el MISMO cuarto después de pasar por TSDF (1 cm),
+  suavizado, aplanado de planos, decimación a 2.5M triángulos y un atlas de
+  ~1.5 mm por texel. El splat no paga nada de eso. Es el mismo render, pero
+  sin las cinco compresiones que lo dejaban borroso.
+
+  SIN DEPENDENCIAS EXTERNAS. Todo (parser de .ply, rasterizador WebGL2,
+  ordenamiento por profundidad, controles) está en este archivo. No carga
+  scripts de ningún CDN: si mañana se cae unpkg, el visor sigue funcionando.
+
+  CÓMO SE USA:
+      /walk?job=<job_id>          ← lo normal: lo resuelve contra el backend
+      /walk?url=<url del .ply>     ← para probar un archivo suelto
+      /walk                        ← abre el selector de archivo local
+  ════════════════════════════════════════════════════════════════════════
+-->
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;overflow:hidden;background:#000;
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#eee}
+  #gl{display:block;width:100%;height:100%;cursor:crosshair}
+  .panel{position:fixed;background:rgba(14,14,18,.86);backdrop-filter:blur(10px);
+    border:1px solid rgba(255,255,255,.10);border-radius:12px;padding:14px 16px}
+  #hud{top:14px;left:14px;font-size:12px;line-height:1.7;max-width:270px}
+  #hud b{color:#00D9FF;font-weight:600}
+  #hud kbd{background:#2b2b33;border:1px solid #44444f;border-bottom-width:2px;
+    border-radius:4px;padding:1px 5px;font:600 11px ui-monospace,monospace;color:#fff}
+  #stats{bottom:14px;left:14px;font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:#9aa}
+  #stats span{color:#fff}
+  #tools{bottom:14px;right:14px;display:flex;flex-direction:column;gap:9px;width:210px}
+  #tools label{font-size:11px;color:#9aa;display:flex;justify-content:space-between}
+  #tools input[type=range]{width:100%;accent-color:#00D9FF}
+  .btn{background:#22222a;border:1px solid #3a3a46;color:#eee;border-radius:8px;
+    padding:8px 10px;font-size:12px;cursor:pointer;text-align:center}
+  .btn:hover{background:#2e2e3a;border-color:#00D9FF}
+  .btn.hot{background:linear-gradient(90deg,#00D9FF,#7B61FF);border:none;
+    color:#fff;font-weight:700}
+  #splash{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:radial-gradient(circle at 50% 40%,#171727,#08080c);z-index:20;text-align:center}
+  #splash .box{max-width:440px;padding:32px}
+  #splash h1{font-size:22px;margin-bottom:10px;
+    background:linear-gradient(90deg,#00D9FF,#7B61FF);-webkit-background-clip:text;
+    background-clip:text;-webkit-text-fill-color:transparent}
+  #splash p{color:#8a8a99;font-size:13px;line-height:1.65;margin-bottom:18px}
+  #bar{height:5px;background:#22222c;border-radius:3px;overflow:hidden;margin:18px 0 10px}
+  #barfill{height:100%;width:0;border-radius:3px;
+    background:linear-gradient(90deg,#00D9FF,#7B61FF);transition:width .2s}
+  #msg{font:12px/1.6 ui-monospace,monospace;color:#7a7a88;min-height:34px}
+  #err{color:#ff6b6b;font-size:12.5px;line-height:1.6;text-align:left;
+    background:rgba(255,80,80,.07);border:1px solid rgba(255,80,80,.25);
+    border-radius:8px;padding:12px;margin-top:14px;display:none}
+  #go{display:none;margin-top:4px;width:100%;padding:13px}
+  #pick{margin-top:12px;font-size:12px;color:#6a6a78}
+  #pick input{display:none}
+  #pick span{color:#00D9FF;cursor:pointer;text-decoration:underline}
+  #center{position:fixed;left:50%;top:50%;width:16px;height:16px;margin:-8px 0 0 -8px;
+    pointer-events:none;opacity:.5;display:none}
+  #center::before,#center::after{content:'';position:absolute;background:#fff}
+  #center::before{left:7px;top:0;width:2px;height:16px}
+  #center::after{top:7px;left:0;height:2px;width:16px}
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="center"></div>
+
+<div class="panel" id="hud" style="display:none">
+  <div><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> caminar &nbsp;·&nbsp; ratón mirar</div>
+  <div><kbd>Shift</kbd> correr &nbsp;·&nbsp; <kbd>Space</kbd>/<kbd>C</kbd> subir/bajar</div>
+  <div><kbd>N</kbd> <b>nivelar</b>: pon el horizonte recto y pulsa</div>
+  <div><kbd>R</kbd> volver al inicio &nbsp;·&nbsp; <kbd>Esc</kbd> soltar ratón</div>
+</div>
+
+<div class="panel" id="stats" style="display:none">
+  <div>gaussianas <span id="sN">—</span></div>
+  <div>fps <span id="sF">—</span> · ordenar <span id="sS">—</span> ms</div>
+  <div id="sD">—</div>
+</div>
+
+<div class="panel" id="tools" style="display:none">
+  <label>campo de visión <span id="vFov">70°</span></label>
+  <input type="range" id="fov" min="40" max="110" step="1" value="70">
+  <label>velocidad <span id="vSpd">1.0×</span></label>
+  <input type="range" id="spd" min="1" max="40" step="1" value="10">
+  <label>exposición <span id="vExp">1.00</span></label>
+  <input type="range" id="exp" min="20" max="260" step="1" value="100">
+  <div class="btn" id="bLevel">Nivelar con la vista actual (N)</div>
+  <div class="btn" id="bReset">Volver al inicio (R)</div>
+</div>
+
+<div id="splash"><div class="box">
+  <h1>Caminar la casa</h1>
+  <p>Visor de splats gaussianos en primera persona. Este es el render
+     <b>sin</b> el paso a malla: sin TSDF, sin suavizado, sin decimar y sin
+     atlas de textura.</p>
+  <div id="bar"><div id="barfill"></div></div>
+  <div id="msg">Buscando el archivo…</div>
+  <div id="err"></div>
+  <button class="btn hot" id="go">Entrar y caminar</button>
+  <div id="pick">o <span id="pickLbl">abre un splat.ply de tu equipo</span>
+    <input type="file" id="pickIn" accept=".ply"></div>
+</div></div>
+
+<script>
+"use strict";
+// ═══════════════════════════════════════════════════════════════════════════
+// 0. UTILIDADES DE PÁGINA
+// ═══════════════════════════════════════════════════════════════════════════
+const $ = id => document.getElementById(id);
+const Q = new URLSearchParams(location.search);
+const setMsg  = t => { $("msg").textContent = t; };
+const setBar  = f => { $("barfill").style.width = (f * 100).toFixed(1) + "%"; };
+function fatal(titulo, detalle) {
+  const e = $("err");
+  e.style.display = "block";
+  e.innerHTML = "<b>" + titulo + "</b><br>" + detalle;
+  setMsg("");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 1. PARSER DE .PLY DE SPLAT GAUSSIANO
+// ---------------------------------------------------------------------------
+// Lee el binario tal cual lo escribe el worker (formato 3DGS estándar) y
+// devuelve arreglos planos listos para subir a la GPU.
+//
+// Del .ply solo se usan: posición, escalas, rotación, opacidad y el término DC
+// de los armónicos esféricos. Los 45 coeficientes f_rest_* se SALTAN a
+// propósito: son el 76% del archivo y aportan el brillo que cambia según desde
+// dónde miras. Todos los visores web (SuperSplat incluido) hacen lo mismo,
+// porque cargarlos costaría ~200 MB de memoria de vídeo por escena.
+// ═══════════════════════════════════════════════════════════════════════════
+const SH_C0 = 0.28209479177387814;   // Y(0,0): convierte el DC en color base
+
+function parsePly(buffer) {
+  const bytes = new Uint8Array(buffer);
+  // -- cabecera ASCII: se busca "end_header" sin decodificar 300 MB --
+  const tope = Math.min(bytes.length, 1 << 16);
+  let cabecera = "", fin = -1;
+  cabecera = new TextDecoder("ascii").decode(bytes.subarray(0, tope));
+  const marca = cabecera.indexOf("end_header");
+  if (marca < 0) throw new Error("no encontré 'end_header': ¿seguro que es un .ply?");
+  fin = cabecera.indexOf("\n", marca) + 1;
+  cabecera = cabecera.slice(0, fin);
+
+  if (!/format\s+binary_little_endian/.test(cabecera))
+    throw new Error("solo leo .ply binario little-endian (este es ascii o big-endian)");
+
+  const mCount = cabecera.match(/element\s+vertex\s+(\d+)/);
+  if (!mCount) throw new Error("la cabecera no declara 'element vertex N'");
+  const N = parseInt(mCount[1], 10);
+
+  // -- mapa de propiedades: nombre -> desplazamiento en bytes dentro del registro --
+  const TAM = { char:1, uchar:1, int8:1, uint8:1, short:2, ushort:2, int16:2, uint16:2,
+                int:4, uint:4, int32:4, uint32:4, float:4, float32:4, double:8, float64:8 };
+  const off = {}, tipo = {};
+  let paso = 0;
+  for (const linea of cabecera.split("\n")) {
+    const p = linea.trim().split(/\s+/);
+    if (p[0] !== "property" || p.length < 3) continue;
+    if (p[1] === "list") throw new Error("propiedades de tipo 'list' no soportadas");
+    const t = p[1], nombre = p[2];
+    if (!(t in TAM)) throw new Error("tipo de propiedad desconocido: " + t);
+    off[nombre] = paso; tipo[nombre] = t; paso += TAM[t];
+  }
+
+  const necesarias = ["x","y","z","opacity","scale_0","scale_1","scale_2",
+                      "rot_0","rot_1","rot_2","rot_3","f_dc_0","f_dc_1","f_dc_2"];
+  const faltan = necesarias.filter(k => !(k in off));
+  if (faltan.length) {
+    // El caso frecuente y con arreglo claro: un .ply de 2DGS sin convertir.
+    if (faltan.length === 1 && faltan[0] === "scale_2")
+      throw new Error("a este .ply le falta <b>scale_2</b>: es un splat de 2DGS " +
+        "sin convertir a 3DGS. El worker ya lo convierte en el PASO 3b — " +
+        "asegúrate de estar usando la versión nueva de worker_gs.py.");
+    throw new Error("al .ply le faltan propiedades: " + faltan.join(", "));
+  }
+  if (paso * N + fin > buffer.byteLength)
+    throw new Error("el archivo está incompleto o cortado (faltan bytes de datos)");
+
+  const dv = new DataView(buffer, fin);
+  const LE = true;
+  // lector genérico: casi siempre float32, pero así no reventamos con otros tipos
+  function leer(base, nombre) {
+    const p = base + off[nombre];
+    switch (tipo[nombre]) {
+      case "float": case "float32":   return dv.getFloat32(p, LE);
+      case "double": case "float64":  return dv.getFloat64(p, LE);
+      case "uchar": case "uint8":     return dv.getUint8(p);
+      case "char": case "int8":       return dv.getInt8(p);
+      case "ushort": case "uint16":   return dv.getUint16(p, LE);
+      case "short": case "int16":     return dv.getInt16(p, LE);
+      case "uint": case "uint32":     return dv.getUint32(p, LE);
+      default:                        return dv.getInt32(p, LE);
+    }
+  }
+
+  // ── salida ──
+  // geometría en RGBA32F, 3 texels por gaussiana:
+  //   texel 0 : posición xyz + opacidad
+  //   texel 1 : covarianza 3D  Σ00 Σ01 Σ02 Σ11
+  //   texel 2 : covarianza 3D  Σ12 Σ22 + relleno
+  // color aparte, en RGBA8 (1 texel), que es el formato natural para un color
+  const datos = new Float32Array(N * 12);
+  const color = new Uint8Array(N * 4);
+  const pos   = new Float32Array(N * 3);      // copia suelta: la usa el ordenador
+  let min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+
+  for (let i = 0; i < N; i++) {
+    const b = i * paso;
+    const x = leer(b, "x"), y = leer(b, "y"), z = leer(b, "z");
+
+    // opacidad: guardada en logit -> sigmoide
+    const op = 1 / (1 + Math.exp(-leer(b, "opacity")));
+    // escalas: guardadas en logaritmo -> exponencial
+    const s0 = Math.exp(leer(b, "scale_0")),
+          s1 = Math.exp(leer(b, "scale_1")),
+          s2 = Math.exp(leer(b, "scale_2"));
+    // rotación: cuaternión (w,x,y,z) normalizado -> matriz
+    let qw = leer(b, "rot_0"), qx = leer(b, "rot_1"),
+        qy = leer(b, "rot_2"), qz = leer(b, "rot_3");
+    const qn = Math.hypot(qw, qx, qy, qz) || 1;
+    qw /= qn; qx /= qn; qy /= qn; qz /= qn;
+
+    // Σ = R·S·Sᵀ·Rᵀ, con S = diag(s0,s1,s2). Como S es diagonal, Σ sale de
+    // sumar las tres columnas de R pesadas por su escala al cuadrado.
+    const r00 = 1-2*(qy*qy+qz*qz), r01 = 2*(qx*qy-qw*qz), r02 = 2*(qx*qz+qw*qy);
+    const r10 = 2*(qx*qy+qw*qz), r11 = 1-2*(qx*qx+qz*qz), r12 = 2*(qy*qz-qw*qx);
+    const r20 = 2*(qx*qz-qw*qy), r21 = 2*(qy*qz+qw*qx), r22 = 1-2*(qx*qx+qy*qy);
+    const a0 = s0*s0, a1 = s1*s1, a2 = s2*s2;
+    const c00 = r00*r00*a0 + r01*r01*a1 + r02*r02*a2;
+    const c01 = r00*r10*a0 + r01*r11*a1 + r02*r12*a2;
+    const c02 = r00*r20*a0 + r01*r21*a1 + r02*r22*a2;
+    const c11 = r10*r10*a0 + r11*r11*a1 + r12*r12*a2;
+    const c12 = r10*r20*a0 + r11*r21*a1 + r12*r22*a2;
+    const c22 = r20*r20*a0 + r21*r21*a1 + r22*r22*a2;
+
+    // color base desde el término DC de los armónicos esféricos
+    const cr = 0.5 + SH_C0 * leer(b, "f_dc_0");
+    const cg = 0.5 + SH_C0 * leer(b, "f_dc_1");
+    const cb = 0.5 + SH_C0 * leer(b, "f_dc_2");
+    const q = i * 4;
+    color[q  ] = Math.max(0, Math.min(255, cr * 255));
+    color[q+1] = Math.max(0, Math.min(255, cg * 255));
+    color[q+2] = Math.max(0, Math.min(255, cb * 255));
+    color[q+3] = 255;
+
+    const o = i * 12;
+    datos[o   ] = x;   datos[o+1 ] = y;   datos[o+2 ] = z;   datos[o+3 ] = op;
+    datos[o+4 ] = c00; datos[o+5 ] = c01; datos[o+6 ] = c02; datos[o+7 ] = c11;
+    datos[o+8 ] = c12; datos[o+9 ] = c22; datos[o+10] = 0;   datos[o+11] = 0;
+
+    pos[i*3] = x; pos[i*3+1] = y; pos[i*3+2] = z;
+    if (x < min[0]) min[0] = x; if (x > max[0]) max[0] = x;
+    if (y < min[1]) min[1] = y; if (y > max[1]) max[1] = y;
+    if (z < min[2]) min[2] = z; if (z > max[2]) max[2] = z;
+  }
+  return { N, datos, color, pos, min, max };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 2. ORIENTACIÓN: ¿DÓNDE ESTÁ "ARRIBA"?
+// ---------------------------------------------------------------------------
+// MASt3R devuelve las poses en un sistema de coordenadas ARBITRARIO: no hay
+// ninguna garantía de que el suelo quede horizontal. Si no se corrige, entras
+// al cuarto de lado o boca abajo y no se puede caminar.
+//
+// Se estima por PERCENTILES: de los tres ejes del mundo, el vertical es aquel
+// en el que la escena es MÁS DELGADA — una casa mide 8x8 m de planta pero solo
+// 2.5 m de alto. Se usa el rango entre percentiles 2 y 98 en vez del mínimo y
+// el máximo para que cuatro puntos sueltos disparados fuera del cuarto no
+// falseen la medida.
+//
+// Es una heurística, no una certeza, así que la tecla N deja NIVELAR a mano:
+// pones el horizonte recto en pantalla y el visor toma esa vertical como
+// buena. Con eso, si la corazonada falla, se arregla en un segundo.
+// ═══════════════════════════════════════════════════════════════════════════
+function estimarArriba(pos, N) {
+  const muestra = Math.min(N, 120000);
+  const salto = Math.max(1, Math.floor(N / muestra));
+  const ejes = [[], [], []];
+  for (let i = 0; i < N; i += salto) {
+    ejes[0].push(pos[i*3]); ejes[1].push(pos[i*3+1]); ejes[2].push(pos[i*3+2]);
+  }
+  const rango = ejes.map(a => {
+    a.sort((p, q) => p - q);
+    return a[Math.floor(a.length * 0.98)] - a[Math.floor(a.length * 0.02)];
+  });
+  let eje = 0;
+  if (rango[1] < rango[eje]) eje = 1;
+  if (rango[2] < rango[eje]) eje = 2;
+  const up = [0, 0, 0]; up[eje] = 1;
+  return { up, rango, eje };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 3. ÁLGEBRA MÍNIMA (matrices columna-mayor, como espera WebGL)
+// ═══════════════════════════════════════════════════════════════════════════
+const V3 = {
+  norm: v => { const l = Math.hypot(v[0],v[1],v[2]) || 1;
+               return [v[0]/l, v[1]/l, v[2]/l]; },
+  cross: (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]],
+  dot: (a,b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2],
+};
+function mirarHacia(ojo, frente, arriba) {
+  // matriz vista (mundo -> cámara), cámara mirando hacia -Z como en OpenGL
+  const f = V3.norm(frente);
+  let s = V3.cross(f, arriba);
+  if (Math.hypot(s[0],s[1],s[2]) < 1e-6) s = V3.cross(f, [f[1], f[2], f[0]]);
+  s = V3.norm(s);
+  const u = V3.cross(s, f);
+  return new Float32Array([
+    s[0], u[0], -f[0], 0,
+    s[1], u[1], -f[1], 0,
+    s[2], u[2], -f[2], 0,
+    -V3.dot(s,ojo), -V3.dot(u,ojo), V3.dot(f,ojo), 1,
+  ]);
+}
+function proyeccion(fx, fy, W, H, cerca, lejos) {
+  // proyección construida desde las focales en PÍXELES, para que coincida
+  // exactamente con la jacobiana que usa el vértice al proyectar la covarianza
+  return new Float32Array([
+    2*fx/W, 0, 0, 0,
+    0, 2*fy/H, 0, 0,
+    0, 0, -(lejos+cerca)/(lejos-cerca), -1,
+    0, 0, -2*lejos*cerca/(lejos-cerca), 0,
+  ]);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 4. SHADERS
+// ═══════════════════════════════════════════════════════════════════════════
+const VS = `#version 300 es
+precision highp float; precision highp int;
+uniform highp sampler2D uData;    // geometría, RGBA32F, 3 texels por gaussiana
+uniform lowp  sampler2D uColor;   // color, RGBA8, 1 texel por gaussiana
+uniform mat4 uView, uProj;
+uniform vec2 uFocal, uVP;
+uniform int  uTexW, uColW;
+in vec2 aCorner;          // esquina del rectángulo, en [-1,1]
+in float aIndex;          // índice de la gaussiana, ya ordenado
+out vec4 vColor;
+out vec2 vLocal;
+
+vec4 tex(int i){ return texelFetch(uData, ivec2(i % uTexW, i / uTexW), 0); }
+
+void main(){
+  int base = int(aIndex) * 3;
+  vec4 t0 = tex(base), t1 = tex(base+1), t2 = tex(base+2);
+
+  vec4 cam = uView * vec4(t0.xyz, 1.0);
+  // Descartar lo que queda detrás de la cámara o pegadísimo al ojo: ahí la
+  // jacobiana de la proyección se dispara y saldrían manchones gigantes.
+  if (cam.z > -0.15) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
+
+  // ── covarianza 3D -> covarianza 2D en pantalla (EWA splatting) ──
+  float s = -cam.z;
+  mat3 J = mat3(
+    uFocal.x/s, 0.0,         0.0,
+    0.0,        uFocal.y/s,  0.0,
+    uFocal.x*cam.x/(s*s), uFocal.y*cam.y/(s*s), 0.0);
+  mat3 W = mat3(uView);                 // rotación mundo -> cámara
+  // Σ2d = (J·W) · Σ3d · (J·W)ᵀ. El código CUDA original de 3DGS escribe esto
+  // como transpose(T)·Σ·T porque allí TANTO J COMO W se construyen ya
+  // transpuestas; aquí las dos están en su forma natural, así que la fórmula
+  // va también en su forma natural. Mezclar las dos convenciones deja las
+  // gaussianas rotadas y estiradas: se ve como un cuarto "rayado".
+  mat3 T = J * W;
+  mat3 S3 = mat3(t1.x, t1.y, t1.z,
+                 t1.y, t1.w, t2.x,
+                 t1.z, t2.x, t2.y);
+  mat3 C = T * S3 * transpose(T);
+  // filtro paso-bajo de 3DGS: garantiza que ninguna gaussiana sea más pequeña
+  // que un píxel; sin él, lo lejano centellea.
+  float a = C[0][0] + 0.3, b = C[0][1], c = C[1][1] + 0.3;
+
+  // ── autovalores/autovectores de la 2x2 -> ejes del rectángulo ──
+  float mid = 0.5 * (a + c);
+  float rad = sqrt(max(mid*mid - (a*c - b*b), 0.1));
+  float l1 = mid + rad, l2 = max(mid - rad, 0.1);
+  if (l1 < 0.3) { gl_Position = vec4(0.0, 0.0, 2.0, 1.0); return; }
+  vec2 e1 = normalize(abs(b) < 1e-8 ? (a >= c ? vec2(1.0,0.0) : vec2(0.0,1.0))
+                                    : vec2(b, l1 - a));
+  // 3 sigmas: más allá la gaussiana vale menos de 1/255 y no se ve
+  vec2 mayor = 3.0 * sqrt(l1) * e1;
+  vec2 menor = 3.0 * sqrt(l2) * vec2(e1.y, -e1.x);
+
+  vec4 clip = uProj * cam;
+  vec2 despPx = aCorner.x * mayor + aCorner.y * menor;
+  gl_Position = vec4(clip.xy / clip.w + despPx / uVP * 2.0, clip.z / clip.w, 1.0);
+
+  // El color vive en su propia textura RGBA8. Antes iba empaquetado en los bits
+  // de uno de estos floats, y eso tenía una trampa: con el canal alfa a 255 el
+  // byte alto queda en 0xFF, o sea exponente todo a unos — el patrón de bits de
+  // un NaN. Muchas GPU de escritorio lo dejan pasar intacto, pero otras (y casi
+  // todas las de móvil) canonizan o vacían los NaN, y ahí el color se pierde.
+  // Una textura de enteros normalizados no tiene ese problema en ninguna GPU.
+  int ci = int(aIndex);
+  vColor = vec4(texelFetch(uColor, ivec2(ci % uColW, ci / uColW), 0).rgb, t0.w);
+  vLocal = aCorner * 3.0;
+}`;
+
+const FS = `#version 300 es
+precision highp float;
+uniform float uExp;
+in vec4 vColor; in vec2 vLocal;
+out vec4 oColor;
+void main(){
+  float alpha = vColor.a * exp(-0.5 * dot(vLocal, vLocal));
+  if (alpha < 0.0039) discard;             // menos de 1/255: invisible
+  // premultiplicado: el mezclado es SRC + DST*(1-SRC_ALPHA), de atrás a delante
+  oColor = vec4(vColor.rgb * uExp * alpha, alpha);
+}`;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5. MOTOR
+// ═══════════════════════════════════════════════════════════════════════════
+const cv = $("gl");
+const gl = cv.getContext("webgl2", { antialias:false, alpha:false,
+                                     premultipliedAlpha:false, depth:false });
+if (!gl) fatal("Tu navegador no tiene WebGL2",
+  "Prueba con Chrome, Edge o Firefox actualizados. En Safari, activa WebGL2 " +
+  "en Ajustes → Avanzado → Funciones experimentales.");
+
+let escena = null, prog = null, texDatos = null, texColor = null;
+let bufIndices = null, vao = null;
+let orden = null, profundidad = null, profReal = null, cubos = null;
+const cam = { pos:[0,0,0], yaw:0, pitch:0, up:[0,1,0], fov:70, vel:1.0, exp:1.0 };
+let inicio = null;
+let ultimaVista = null, msOrden = 0;
+
+function compilar(tipo, src) {
+  const s = gl.createShader(tipo);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error("shader: " + gl.getShaderInfoLog(s));
+  return s;
+}
+
+function iniciarGL(esc) {
+  escena = esc;
+  prog = gl.createProgram();
+  gl.attachShader(prog, compilar(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compilar(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+    throw new Error("enlazado: " + gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+
+  if (!gl.getExtension("EXT_color_buffer_float") &&
+      !gl.getExtension("OES_texture_float_linear")) { /* solo lo consultamos */ }
+
+  // ── datos de las gaussianas en una textura RGBA32F (3 texels cada una) ──
+  const texels = esc.N * 3;
+  const maxW = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+  const W = Math.min(2048, maxW);
+  const H = Math.ceil(texels / W);
+  if (H > maxW) throw new Error(
+    "la escena tiene " + esc.N.toLocaleString("es") + " gaussianas y no cabe en " +
+    "una textura de esta GPU. Vuelve a exportar con SPLAT_MIN_OPACITY más alto " +
+    "(por ejemplo 0.05) para quitar las más transparentes.");
+  const relleno = new Float32Array(W * H * 4);
+  relleno.set(esc.datos.subarray(0, Math.min(esc.datos.length, relleno.length)));
+
+  texDatos = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texDatos);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, W, H, 0, gl.RGBA, gl.FLOAT, relleno);
+  gl.uniform1i(gl.getUniformLocation(prog, "uData"), 0);
+  gl.uniform1i(gl.getUniformLocation(prog, "uTexW"), W);
+
+  // ── color en su propia textura RGBA8 (1 texel por gaussiana) ──
+  const CW = Math.min(2048, maxW);
+  const CH = Math.ceil(esc.N / CW);
+  const relC = new Uint8Array(CW * CH * 4);
+  relC.set(esc.color);
+  texColor = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, texColor);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, CW, CH, 0, gl.RGBA, gl.UNSIGNED_BYTE, relC);
+  gl.uniform1i(gl.getUniformLocation(prog, "uColor"), 1);
+  gl.uniform1i(gl.getUniformLocation(prog, "uColW"), CW);
+  gl.activeTexture(gl.TEXTURE0);
+
+  // ── geometría: un rectángulo, instanciado una vez por gaussiana ──
+  vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER,
+    new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+  const locC = gl.getAttribLocation(prog, "aCorner");
+  gl.enableVertexAttribArray(locC);
+  gl.vertexAttribPointer(locC, 2, gl.FLOAT, false, 0, 0);
+
+  bufIndices = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufIndices);
+  gl.bufferData(gl.ARRAY_BUFFER, esc.N * 4, gl.DYNAMIC_DRAW);
+  const locI = gl.getAttribLocation(prog, "aIndex");
+  gl.enableVertexAttribArray(locI);
+  gl.vertexAttribPointer(locI, 1, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribDivisor(locI, 1);          // un índice por instancia
+
+  orden = new Float32Array(esc.N);
+  profReal = new Float32Array(esc.N);       // profundidad exacta (metros)
+  profundidad = new Int32Array(esc.N);      // esa profundidad, en 65536 casilleros
+  cubos = new Uint32Array(65536);
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.enable(gl.BLEND);
+  // "over" premultiplicado, dibujando de ATRÁS hacia DELANTE
+  gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.clearColor(0.02, 0.02, 0.03, 1);
+}
+
+// ── ORDENAMIENTO POR PROFUNDIDAD ──
+// Las gaussianas son semitransparentes, así que el orden en que se dibujan
+// CAMBIA el resultado: hay que pintarlas de la más lejana a la más cercana.
+// Ordenar 1.000.000 de elementos con sort() serían ~400 ms (3 fps). Aquí se usa
+// un ordenamiento por CASILLEROS sobre la profundidad cuantizada a 16 bits:
+// es lineal, sin comparaciones, y baja a ~8 ms. Es el mismo truco de los
+// visores de splats conocidos.
+function ordenar(vista) {
+  const t0 = performance.now();
+  const { N, pos } = escena;
+  // fila Z de la matriz vista = dirección hacia dónde mira la cámara
+  const zx = vista[2], zy = vista[6], zz = vista[10], zw = vista[14];
+  let min = Infinity, max = -Infinity;
+  // OJO: la profundidad se guarda en un Float32Array, NO en el Int32Array de
+  // los casilleros. Escribirla en un Int32Array la TRUNCA a entero, y como la
+  // escena de MASt3R mide solo unas pocas unidades, todas las gaussianas
+  // caerían en dos o tres valores y el orden sería basura.
+  for (let i = 0; i < N; i++) {
+    const d = zx*pos[i*3] + zy*pos[i*3+1] + zz*pos[i*3+2] + zw;
+    profReal[i] = d;
+    if (d < min) min = d; if (d > max) max = d;
+  }
+  const esc = max > min ? 65535 / (max - min) : 0;
+  cubos.fill(0);
+  for (let i = 0; i < N; i++) {
+    const c = ((profReal[i] - min) * esc) | 0;
+    profundidad[i] = c; cubos[c]++;
+  }
+  // suma acumulada -> posición inicial de cada casillero
+  for (let i = 1; i < 65536; i++) cubos[i] += cubos[i-1];
+  // Este reparto deja los casilleros en orden ASCENDENTE. Como la cámara mira
+  // hacia -Z, la z más negativa es la más lejana, o sea que ascendente ya es
+  // de ATRÁS HACIA DELANTE, que es justo el orden que necesita el mezclado.
+  for (let i = 0; i < N; i++) orden[--cubos[profundidad[i]]] = i;
+  msOrden = performance.now() - t0;
+  gl.bindBuffer(gl.ARRAY_BUFFER, bufIndices);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, orden);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 6. CONTROLES EN PRIMERA PERSONA
+// ═══════════════════════════════════════════════════════════════════════════
+const teclas = Object.create(null);
+let capturado = false;
+
+function frente() {
+  // la vista se construye alrededor del eje "arriba" que el usuario haya fijado
+  const u = cam.up;
+  let ref = Math.abs(u[1]) < 0.9 ? [0,1,0] : [1,0,0];
+  const d = V3.norm(V3.cross(u, ref));         // eje "este" del plano horizontal
+  const n = V3.cross(u, d);                    // eje "norte"
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  return V3.norm([
+    cp*(cy*n[0] + sy*d[0]) + sp*u[0],
+    cp*(cy*n[1] + sy*d[1]) + sp*u[1],
+    cp*(cy*n[2] + sy*d[2]) + sp*u[2],
+  ]);
+}
+
+// La captura del ratón falla en algunos contextos (iframes, permisos), y
+// devuelve una promesa RECHAZADA que ensucia la consola. Se captura: sin ratón
+// capturado el visor sigue siendo usable con las flechas y arrastrando.
+function pedirRaton() {
+  try {
+    const p = cv.requestPointerLock();
+    if (p && p.catch) p.catch(() => toast("El ratón no se pudo capturar; usa las flechas"));
+  } catch (e) { toast("El ratón no se pudo capturar; usa las flechas"); }
+}
+// Sin captura de ratón: arrastrar con el botón pulsado también gira la vista.
+let arrastrando = false;
+cv.addEventListener("mousedown", () => { arrastrando = true; });
+addEventListener("mouseup", () => { arrastrando = false; });
+cv.addEventListener("click", () => { if (!capturado) pedirRaton(); });
+document.addEventListener("pointerlockchange", () => {
+  capturado = document.pointerLockElement === cv;
+  $("center").style.display = capturado ? "block" : "none";
+});
+document.addEventListener("mousemove", e => {
+  if (!capturado && !arrastrando) return;
+  cam.yaw   -= e.movementX * 0.0022;
+  cam.pitch -= e.movementY * 0.0022;
+  const lim = Math.PI/2 - 0.02;
+  cam.pitch = Math.max(-lim, Math.min(lim, cam.pitch));
+});
+addEventListener("keydown", e => {
+  teclas[e.code] = true;
+  if (e.code === "KeyN") nivelar();
+  if (e.code === "KeyR") volverAlInicio();
+  if (e.code === "Space") e.preventDefault();
+});
+addEventListener("keyup", e => { teclas[e.code] = false; });
+
+// NIVELAR: toma la vertical de la pantalla en este instante y la declara
+// "arriba". Es la salida de emergencia si la corazonada automática falló.
+function nivelar() {
+  const f = frente();
+  const u = cam.up;
+  // "arriba en pantalla" = la parte de la vertical actual perpendicular al
+  // frente. Al adoptarla como nuevo "arriba", el frente queda exactamente
+  // horizontal: lo que tengas centrado en la pantalla pasa a ser el horizonte.
+  const derecha = V3.norm(V3.cross(f, u));
+  const nuevoUp = V3.norm(V3.cross(derecha, f));
+  cam.up = nuevoUp;
+  cam.pitch = 0;                 // ahora el frente ES el horizonte
+  cam.yaw = 0;
+  // recolocar el yaw para no dar un salto: se busca el yaw que reproduce f
+  const u2 = cam.up;
+  let ref = Math.abs(u2[1]) < 0.9 ? [0,1,0] : [1,0,0];
+  const dd = V3.norm(V3.cross(u2, ref)), nn = V3.cross(u2, dd);
+  cam.yaw = Math.atan2(V3.dot(f, dd), V3.dot(f, nn));
+  toast("Nivelado: esta vertical es la nueva referencia");
+}
+
+function volverAlInicio() {
+  if (!inicio) return;
+  cam.pos = inicio.pos.slice();
+  cam.yaw = inicio.yaw; cam.pitch = 0; cam.up = inicio.up.slice();
+}
+
+let toastT = null, avisoBase = "";
+function toast(t) {
+  $("sD").textContent = t;
+  clearTimeout(toastT);
+  toastT = setTimeout(() => { $("sD").textContent = avisoBase; }, 2200);
+}
+
+function mover(dt) {
+  const f = frente();
+  const derecha = V3.norm(V3.cross(f, cam.up));
+  // CAMINAR, NO VOLAR: al andar se avanza por el plano horizontal aunque estés
+  // mirando al techo. Sin esto, mirar hacia arriba y pulsar W te sube por el
+  // aire, que es exactamente lo que rompe la sensación de estar dentro de la
+  // casa. Para subir/bajar están Space y C, que sí son deliberados.
+  let caminar = [f[0] - cam.up[0]*V3.dot(f, cam.up),
+                 f[1] - cam.up[1]*V3.dot(f, cam.up),
+                 f[2] - cam.up[2]*V3.dot(f, cam.up)];
+  // mirando en vertical perfecta no queda dirección horizontal: se usa la
+  // última buena en vez de dejar de responder a las teclas
+  caminar = Math.hypot(caminar[0], caminar[1], caminar[2]) > 1e-4
+            ? V3.norm(caminar) : V3.norm(V3.cross(cam.up, derecha));
+  let vx = 0, vy = 0, vz = 0;
+  const paso = cam.vel * (teclas.ShiftLeft || teclas.ShiftRight ? 3.2 : 1) * dt;
+  const add = (v, k) => { vx += v[0]*k; vy += v[1]*k; vz += v[2]*k; };
+  if (teclas.KeyW || teclas.ArrowUp)    add(caminar,  paso);
+  if (teclas.KeyS || teclas.ArrowDown)  add(caminar, -paso);
+  if (teclas.KeyD || teclas.ArrowRight) add(derecha,  paso);
+  if (teclas.KeyA || teclas.ArrowLeft)  add(derecha, -paso);
+  if (teclas.Space)                     add(cam.up,  paso);
+  if (teclas.KeyC || teclas.ControlLeft) add(cam.up, -paso);
+  cam.pos[0] += vx; cam.pos[1] += vy; cam.pos[2] += vz;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7. BUCLE
+// ═══════════════════════════════════════════════════════════════════════════
+let tPrev = performance.now(), fps = 0, acumF = 0, nF = 0;
+function bucle(t) {
+  requestAnimationFrame(bucle);
+  if (!escena) return;
+  const dt = Math.min((t - tPrev) / 1000, 0.1); tPrev = t;
+  acumF += dt; nF++;
+  if (acumF > 0.4) { fps = nF / acumF; acumF = 0; nF = 0;
+    $("sF").textContent = fps.toFixed(0);
+    $("sS").textContent = msOrden.toFixed(1);
+  }
+  mover(dt);
+
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const W = Math.round(cv.clientWidth * dpr), H = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  gl.viewport(0, 0, W, H);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  const vista = mirarHacia(cam.pos, frente(), cam.up);
+  const fy = H / (2 * Math.tan(cam.fov * Math.PI / 360));
+  const fx = fy;                              // píxeles cuadrados
+  const proy = proyeccion(fx, fy, W, H, 0.05, 500);
+
+  // Reordenar solo cuando la vista cambió de verdad: si estás quieto mirando
+  // una pared, el orden anterior sigue siendo válido y nos ahorramos 8 ms.
+  if (!ultimaVista || cambioSuficiente(vista, ultimaVista)) {
+    ordenar(vista);
+    ultimaVista = vista.slice();
+  }
+
+  gl.useProgram(prog);
+  gl.bindVertexArray(vao);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texDatos);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texColor);
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog, "uView"), false, vista);
+  gl.uniformMatrix4fv(gl.getUniformLocation(prog, "uProj"), false, proy);
+  gl.uniform2f(gl.getUniformLocation(prog, "uFocal"), fx, fy);
+  gl.uniform2f(gl.getUniformLocation(prog, "uVP"), W, H);
+  gl.uniform1f(gl.getUniformLocation(prog, "uExp"), cam.exp);
+  gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, escena.N);
+}
+function cambioSuficiente(a, b) {
+  let d = 0;
+  for (let i = 0; i < 16; i++) d += Math.abs(a[i] - b[i]);
+  return d > 0.004;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. CARGA
+// ═══════════════════════════════════════════════════════════════════════════
+async function descargar(url) {
+  setMsg("Descargando el splat…");
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("el servidor respondió HTTP " + r.status);
+  const total = +(r.headers.get("content-length") || 0);
+  if (!r.body || !total) { setBar(0.5); return await r.arrayBuffer(); }
+  const trozos = []; let leido = 0;
+  const lector = r.body.getReader();
+  for (;;) {
+    const { done, value } = await lector.read();
+    if (done) break;
+    trozos.push(value); leido += value.length;
+    setBar(0.75 * leido / total);
+    setMsg("Descargando… " + (leido/1e6).toFixed(1) + " / " + (total/1e6).toFixed(1) + " MB");
+  }
+  const buf = new Uint8Array(leido); let o = 0;
+  for (const c of trozos) { buf.set(c, o); o += c.length; }
+  return buf.buffer;
+}
+
+async function resolverURL() {
+  if (Q.get("url")) return Q.get("url");
+  const job = Q.get("job");
+  if (!job) return null;
+  setMsg("Preguntando al backend por el job " + job + "…");
+  const r = await fetch("/api/rescue/" + encodeURIComponent(job));
+  const d = await r.json().catch(() => null);
+  if (!d || !d.splat_url) throw new Error(
+    "el job <b>" + job + "</b> todavía no tiene splat en R2. " +
+    "Si el render sigue corriendo, el splat aparece justo al terminar el " +
+    "entrenamiento (sobre el 45% de la barra).");
+  return d.splat_url;
+}
+
+async function arrancar(buffer) {
+  setBar(0.8); setMsg("Leyendo las gaussianas…");
+  await new Promise(r => setTimeout(r, 16));      // deja repintar la barra
+  const esc = parsePly(buffer);
+  setBar(0.92); setMsg("Subiendo a la tarjeta gráfica…");
+  await new Promise(r => setTimeout(r, 16));
+  iniciarGL(esc);
+
+  // ── colocar al visitante dentro del cuarto ──
+  const { up, rango, eje } = estimarArriba(esc.pos, esc.N);
+  cam.up = up;
+  const centro = [(esc.min[0]+esc.max[0])/2, (esc.min[1]+esc.max[1])/2,
+                  (esc.min[2]+esc.max[2])/2];
+  cam.pos = centro.slice();
+  // ojos a la altura de una persona: un poco por encima del centro vertical
+  cam.pos[eje] = esc.min[eje] + (esc.max[eje] - esc.min[eje]) * 0.55;
+  cam.yaw = 0; cam.pitch = 0;
+  // la velocidad por defecto se ajusta al tamaño real de la escena
+  const diag = Math.hypot(rango[0], rango[1], rango[2]);
+  cam.vel = diag / 12;
+  $("spd").value = 10;
+  $("vSpd").textContent = cam.vel.toFixed(2) + " u/s";
+  inicio = { pos: cam.pos.slice(), yaw: 0, up: up.slice() };
+
+  setBar(1); setMsg("");
+  $("sN").textContent = esc.N.toLocaleString("es");
+  avisoBase = "vertical estimada: eje " + "XYZ"[eje] + " (si entras torcido, pulsa N)";
+  $("sD").textContent = avisoBase;
+  $("go").style.display = "block";
+  $("go").onclick = () => {
+    $("splash").style.display = "none";
+    $("hud").style.display = $("stats").style.display = $("tools").style.display = "block";
+    pedirRaton();
+  };
+}
+
+// ── controles del panel ──
+$("fov").oninput = e => { cam.fov = +e.target.value; $("vFov").textContent = cam.fov + "°"; };
+$("spd").oninput = e => {
+  const diag = escena ? Math.hypot(escena.max[0]-escena.min[0],
+                                   escena.max[1]-escena.min[1],
+                                   escena.max[2]-escena.min[2]) : 12;
+  cam.vel = diag * (+e.target.value) / 120;
+  $("vSpd").textContent = cam.vel.toFixed(2) + " u/s";
+};
+$("exp").oninput = e => { cam.exp = (+e.target.value)/100; $("vExp").textContent = cam.exp.toFixed(2); };
+$("bLevel").onclick = nivelar;
+$("bReset").onclick = volverAlInicio;
+$("pickLbl").onclick = () => $("pickIn").click();
+$("pickIn").onchange = e => {
+  const f = e.target.files[0]; if (!f) return;
+  $("err").style.display = "none";
+  setMsg("Leyendo " + f.name + "…");
+  f.arrayBuffer().then(arrancar).catch(e =>
+    fatal("No pude abrir ese archivo", e.message));
+};
+
+requestAnimationFrame(bucle);
+(async () => {
+  try {
+    const url = await resolverURL();
+    if (!url) {
+      setMsg("Pásame un ?job=<id> o un ?url=<enlace al .ply>, " +
+             "o abre un archivo de tu equipo.");
+      setBar(0);
+      return;
+    }
+    await arrancar(await descargar(url));
+  } catch (e) {
+    fatal("No pude cargar el splat", e.message);
+  }
+})();
+</script>
+</body>
+</html>
