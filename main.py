@@ -401,6 +401,20 @@ class RunPod:
             (GPU_FALLBACK_LIST,  "SECURE"),      # 3º: ya sin 4090, la jerarquía normal
             (GPU_FALLBACK_LIST,  "COMMUNITY"),   # 4º
         ]
+        # ── ESCAPE: pedir SOLO máquinas de datacenter ──
+        # PROBLEMA REAL (jobs 89594d0e y 98baa13b, los dos con 4090 COMMUNITY):
+        # nvidia-smi veía la tarjeta perfectamente, pero CUDA no arrancaba
+        # ("CUDA unknown error"). Eso pasa cuando al contenedor le falta
+        # /dev/nvidia-uvm, que es lo que CUDA necesita y nvidia-smi no. Es un
+        # problema de CÓMO ESTÁ MONTADA LA MÁQUINA, y las de COMMUNITY son
+        # equipos de particulares: si a uno le falta, te lo vas a encontrar una
+        # y otra vez mientras se siga pidiendo esa nube primero.
+        # Con GPU_SOLO_SECURE=1 se piden solo máquinas de datacenter, que están
+        # configuradas por profesionales. Salen algo más caras y puede que no
+        # toque 4090, pero arrancan.
+        if os.environ.get("GPU_SOLO_SECURE", "0") == "1":
+            intentos = [(SOLO_4090, "SECURE"), (GPU_FALLBACK_LIST, "SECURE")]
+            print("[rest] GPU_SOLO_SECURE=1 -> solo datacenter (SECURE), sin COMMUNITY")
         ultimos_errores = []
         for gpu_ids, cloud in intentos:
             # Body con SOLO los campos que el esquema REST de RunPod acepta.
